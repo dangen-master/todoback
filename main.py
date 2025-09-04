@@ -25,13 +25,12 @@ async def lifespan(app_: FastAPI):
 
 app = FastAPI(title="Edu MiniApp API", lifespan=lifespan)
 
+FRONTEND_ORIGIN = "https://telegrammapp-44890.web.app"
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://telegrammapp-44890.web.app",  # твой фронт
-    ],
+    allow_origins=[FRONTEND_ORIGIN],       # важно: точное совпадение origin
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
