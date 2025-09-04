@@ -27,9 +27,11 @@ app = FastAPI(title="Edu MiniApp API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://telegrammapp-44890.web.app"],
+    allow_origins=[
+        "https://telegrammapp-44890.web.app",  # твой фронт
+    ],
     allow_credentials=True,
-    allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -201,4 +203,3 @@ async def grant_access_groups(body: GrantGroupsIn, session: AsyncSession = Depen
     updated = await lessons_repo.grant_access_to_groups(session, lesson_id=body.lesson_id, group_ids=body.group_ids)
     await session.commit()
     return {"updated": updated}
-#тест
