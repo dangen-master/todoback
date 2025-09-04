@@ -27,11 +27,12 @@ app = FastAPI(title="Edu MiniApp API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # при куках укажи конкретные домены и allow_credentials=True
-    allow_credentials=False,
-    allow_methods=["*"],
+    allow_origins=["https://telegrammapp-44890.web.app"],
+    allow_credentials=True,
+    allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
     allow_headers=["*"],
 )
+
 
 
 # ---------- DB session dependency ----------
