@@ -109,6 +109,9 @@ class GrantGroupsIn(BaseModel):
 
 
 # ---------- Endpoints ----------
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "message": "Сервер работает"}
 
 @app.post("/api/user/ensure")
 async def api_ensure_user(data: EnsureUserIn, session: AsyncSession = Depends(get_session)):
