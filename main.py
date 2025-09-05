@@ -28,8 +28,9 @@ app = FastAPI(title="Edu MiniApp API", lifespan=lifespan)
 FRONTEND_ORIGIN = "https://telegrammapp-44890.web.app"
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # важно: точное совпадение origin
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
