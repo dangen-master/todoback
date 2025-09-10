@@ -1,6 +1,3 @@
-
-from __future__ import annotations
-
 from datetime import datetime
 from typing import Optional, List
 
@@ -23,8 +20,10 @@ def _set_sqlite_pragma(dbapi_connection, connection_record):
     cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
+
 class Base(DeclarativeBase):
     pass
+
 
 # ---------- Enums ----------
 LessonStatusEnum = Enum(
@@ -46,7 +45,8 @@ BlockTypeEnum = Enum(
 PK_INT = Integer
 FK_INT = Integer
 
-# Timestamps mixin (UTC, SQLite-friendly defaults)
+
+# ---------- Mixins ----------
 class TimestampMixin:
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.datetime("now"), nullable=False
@@ -55,6 +55,7 @@ class TimestampMixin:
         DateTime(timezone=False), server_default=func.datetime("now"),
         onupdate=func.datetime("now"), nullable=False
     )
+
 
 # ---------- Models ----------
 class User(TimestampMixin, Base):
@@ -81,18 +82,23 @@ class User(TimestampMixin, Base):
     def __repr__(self) -> str:
         return f"<User id={self.id} tg={self.telegram_id}>"
 
+
 class Role(Base):
     __tablename__ = "roles"
+
     id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
     code: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String, nullable=False)
 
     users: Mapped[List[User]] = relationship("User", secondary="user_roles", back_populates="roles")
 
+
 class UserRole(Base):
     __tablename__ = "user_roles"
+
     user_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     role_id: Mapped[int] = mapped_column(SmallInteger, ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True)
+
 
 class Group(TimestampMixin, Base):
     __tablename__ = "groups"
@@ -104,13 +110,17 @@ class Group(TimestampMixin, Base):
     members: Mapped[List[User]] = relationship("User", secondary="group_members", back_populates="groups", lazy="selectin")
     lesson_access: Mapped[List["LessonAccessGroup"]] = relationship("LessonAccessGroup", back_populates="group")
 
+
 class GroupMember(Base):
     __tablename__ = "group_members"
+
     group_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True)
     user_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     role_in_group: Mapped[Optional[str]] = mapped_column(String)
     added_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), server_default=func.datetime("now"), nullable=False)
+
     __table_args__ = (Index("idx_group_members_user", "user_id"),)
+
 
 class Subject(TimestampMixin, Base):
     __tablename__ = "subjects"
@@ -126,6 +136,7 @@ class Subject(TimestampMixin, Base):
     lessons: Mapped[List["Lesson"]] = relationship(
         "Lesson", back_populates="subject", cascade="all, delete-orphan", lazy="selectin"
     )
+
 
 class Lesson(TimestampMixin, Base):
     __tablename__ = "lessons"
@@ -157,6 +168,7 @@ class Lesson(TimestampMixin, Base):
 
     __table_args__ = (Index("idx_lessons_subject", "subject_id"),)
 
+
 class LessonBlock(TimestampMixin, Base):
     __tablename__ = "lesson_blocks"
 
@@ -165,7 +177,6 @@ class LessonBlock(TimestampMixin, Base):
     type: Mapped[str] = mapped_column(BlockTypeEnum, nullable=False)
     position: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    # Renamed to 'text' (was text_content) for consistency with API
     text: Mapped[Optional[str]] = mapped_column(Text)
     image_url: Mapped[Optional[str]] = mapped_column(Text)
     caption: Mapped[Optional[str]] = mapped_column(Text)
@@ -179,8 +190,10 @@ class LessonBlock(TimestampMixin, Base):
         CheckConstraint("(type <> 'image') OR (image_url IS NOT NULL)", name="chk_block_image_when_image"),
     )
 
+
 class LessonAccessUser(Base):
     __tablename__ = "lesson_access_users"
+
     lesson_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("lessons.id", ondelete="CASCADE"), primary_key=True)
     user_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     granted_by: Mapped[Optional[int]] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="SET NULL"))
@@ -188,14 +201,18 @@ class LessonAccessUser(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), server_default=func.datetime("now"), nullable=False)
 
     lesson: Mapped["Lesson"] = relationship("Lesson", back_populates="access_users")
-    user: Mapped["User"] = relationship("User")
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])                       # ✅ фикс
+    granted_by_user: Mapped[Optional["User"]] = relationship("User", foreign_keys=[granted_by])  # ✅ фикс
+
     __table_args__ = (
         Index("idx_access_users_user", "user_id"),
         Index("idx_access_users_lesson", "lesson_id"),
     )
 
+
 class LessonAccessGroup(Base):
     __tablename__ = "lesson_access_groups"
+
     lesson_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("lessons.id", ondelete="CASCADE"), primary_key=True)
     group_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True)
     granted_by: Mapped[Optional[int]] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="SET NULL"))
@@ -204,13 +221,17 @@ class LessonAccessGroup(Base):
 
     lesson: Mapped["Lesson"] = relationship("Lesson", back_populates="access_groups")
     group: Mapped["Group"] = relationship("Group", back_populates="lesson_access")
+    granted_by_user: Mapped[Optional["User"]] = relationship("User", foreign_keys=[granted_by])  # ✅ фикс
+
     __table_args__ = (
         Index("idx_access_groups_group", "group_id"),
         Index("idx_access_groups_lesson", "lesson_id"),
     )
 
+
 class LessonView(Base):
     __tablename__ = "lesson_views"
+
     lesson_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("lessons.id", ondelete="CASCADE"), primary_key=True)
     user_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     viewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), server_default=func.datetime("now"), nullable=False)
@@ -218,14 +239,17 @@ class LessonView(Base):
     lesson: Mapped["Lesson"] = relationship("Lesson", back_populates="views")
     user: Mapped["User"] = relationship("User")
 
+
 class Bookmark(Base):
     __tablename__ = "bookmarks"
+
     user_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     lesson_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("lessons.id", ondelete="CASCADE"), primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), server_default=func.datetime("now"), nullable=False)
 
     lesson: Mapped["Lesson"] = relationship("Lesson", back_populates="bookmarks")
     user: Mapped["User"] = relationship("User")
+
 
 # ---------- Schema init ----------
 async def init_db():
