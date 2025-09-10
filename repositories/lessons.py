@@ -1,4 +1,3 @@
-from __future__ import annotations
 from typing import List, Sequence
 
 from sqlalchemy import select, func, and_, or_, literal
