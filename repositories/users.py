@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 from typing import Optional
 
@@ -16,9 +17,8 @@ async def ensure_user(
     last_name: Optional[str] = None,
     avatar_url: Optional[str] = None,
 ) -> User:
-    """Найдёт пользователя по telegram_id или создаст нового.
-    Обновит «профильные» поля, если переданы.
-    """
+    """Find user by telegram_id or create a new one.
+    Updates profile fields if provided."""
     user = await session.scalar(select(User).where(User.telegram_id == tg_id))
     if user:
         changed = False

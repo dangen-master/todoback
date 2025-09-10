@@ -1,15 +1,16 @@
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from models import async_session, init_db, User
+from models import async_session, init_db
 from repositories import users as users_repo
 from repositories import subjects as subjects_repo
 from repositories import lessons as lessons_repo
@@ -28,12 +29,11 @@ app = FastAPI(title="Edu MiniApp API", lifespan=lifespan)
 FRONTEND_ORIGIN = "https://telegrammapp-44890.web.app"
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 
 # ---------- DB session dependency ----------
@@ -60,7 +60,7 @@ class SubjectCreateIn(BaseModel):
 
 class SubjectOut(BaseModel):
     id: int
-    code: Optional[str]
+    code: Optional[str] = None
     name: str
     description: Optional[str] = None
 
@@ -71,15 +71,19 @@ class LessonBlockIn(BaseModel):
     image_url: Optional[str] = None
     caption: Optional[str] = None
 
-    @validator("text", always=True)
-    def validate_text_for_type(cls, v, values):
-        if values.get("type") == "text" and not v:
+    @field_validator("text")
+    @classmethod
+    def validate_text_for_type(cls, v, info):
+        data = info.data
+        if data.get("type") == "text" and not v:
             raise ValueError("text is required when type='text'")
         return v
 
-    @validator("image_url", always=True)
-    def validate_image_for_type(cls, v, values):
-        if values.get("type") == "image" and not v:
+    @field_validator("image_url")
+    @classmethod
+    def validate_image_for_type(cls, v, info):
+        data = info.data
+        if data.get("type") == "image" and not v:
             raise ValueError("image_url is required when type='image'")
         return v
 
@@ -88,7 +92,7 @@ class LessonCreateIn(BaseModel):
     subject_id: int
     title: str
     publish: bool = True
-    blocks: List[LessonBlockIn]
+    blocks: list[LessonBlockIn]
     created_by_tg: Optional[int] = None
 
 
@@ -100,18 +104,19 @@ class LessonOut(BaseModel):
 
 class GrantUsersIn(BaseModel):
     lesson_id: int
-    user_tg_ids: List[int]
+    user_tg_ids: list[int]
 
 
 class GrantGroupsIn(BaseModel):
     lesson_id: int
-    group_ids: List[int]
+    group_ids: list[int]
 
 
 # ---------- Endpoints ----------
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "message": "Сервер работает"}
+
 
 @app.post("/api/user/ensure")
 async def api_ensure_user(data: EnsureUserIn, session: AsyncSession = Depends(get_session)):
@@ -127,7 +132,7 @@ async def api_ensure_user(data: EnsureUserIn, session: AsyncSession = Depends(ge
     return {"id": user.id, "tg_id": user.telegram_id}
 
 
-@app.get("/api/subjects", response_model=List[SubjectOut])
+@app.get("/api/subjects", response_model=list[SubjectOut])
 async def list_subjects(session: AsyncSession = Depends(get_session)):
     rows = await subjects_repo.list_subjects(session)
     return [SubjectOut(id=s.id, code=s.code, name=s.name, description=s.description) for s in rows]
@@ -157,8 +162,10 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
         creator = await users_repo.ensure_user(session, payload.created_by_tg)
         created_by_id = creator.id
 
-    # преобразуем blocks в dict-список под репозиторий
-    blocks = [{"type": b.type, "text": b.text, "image_url": b.image_url, "caption": b.caption} for b in payload.blocks]
+    blocks = [
+        {"type": b.type, "text": b.text, "image_url": b.image_url, "caption": b.caption}
+        for b in payload.blocks
+    ]
 
     try:
         lesson = await lessons_repo.create_lesson(
@@ -169,14 +176,16 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
             publish=payload.publish,
             created_by=created_by_id,
         )
-    except ValueError as e:
+    except lessons_repo.SubjectNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except lessons_repo.PayloadInvalidError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     await session.commit()
     return LessonOut(id=lesson.id, subject_id=lesson.subject_id, title=lesson.title)
 
 
-@app.get("/api/lessons/accessible/{tg_id}", response_model=List[LessonOut])
+@app.get("/api/lessons/accessible/{tg_id}", response_model=list[LessonOut])
 async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session)):
     user = await users_repo.get_user_by_tg(session, tg_id)
     if not user:
@@ -187,12 +196,11 @@ async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_ses
 
 @app.post("/api/access/grant/users")
 async def grant_access_users(body: GrantUsersIn, session: AsyncSession = Depends(get_session)):
-    # конвертируем tg_id -> id
     if not body.user_tg_ids:
         return {"updated": 0}
-    user_ids: List[int] = []
+    user_ids: list[int] = []
     for tg in body.user_tg_ids:
-        u = await users_repo.ensure_user(session, tg)   # создадим при необходимости
+        u = await users_repo.ensure_user(session, tg)
         user_ids.append(u.id)
 
     updated = await lessons_repo.grant_access_to_users(session, lesson_id=body.lesson_id, user_ids=user_ids)
