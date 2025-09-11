@@ -12,22 +12,16 @@ from repositories import users as users_repo
 from repositories import subjects as subjects_repo
 from repositories import lessons as lessons_repo
 
-
 # ---------- DB session dependency ----------
 async def get_session() -> AsyncIterator[AsyncSession]:
     async with async_session() as session:
         yield session
-
 
 # ---------- Auth / RBAC ----------
 async def get_current_user(
     session: AsyncSession = Depends(get_session),
     x_debug_tg_id: Optional[int] = Header(None, alias="X-Debug-Tg-Id"),
 ):
-    """
-    DEV-версия авторизации: заголовок X-Debug-Tg-Id.
-    Для прод: подставить разбор X-Telegram-Init-Data.
-    """
     if not x_debug_tg_id:
         raise HTTPException(status_code=401, detail="Missing X-Debug-Tg-Id")
     user = await users_repo.get_user_by_tg(session, x_debug_tg_id)
@@ -48,14 +42,11 @@ def require_roles(*allowed: str) -> Callable[..., Awaitable[Any]]:
         return prof or me
     return checker
 
-
 # ---------- Lifespan ----------
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
     await init_db()
-    print("API is ready")
     yield
-
 
 app = FastAPI(title="Edu MiniApp API", lifespan=lifespan)
 
@@ -67,7 +58,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # ---------- Schemas ----------
 class EnsureUserIn(BaseModel):
@@ -112,8 +102,7 @@ class LessonCreateIn(BaseModel):
     title: str
     publish: bool = True
     blocks: list[LessonBlockIn]
-    created_by_tg: Optional[int] = None
-    # новые поля: сразу выдать доступ после создания
+    # сразу выдать доступ (опционально)
     group_ids: Optional[list[int]] = None
     user_tg_ids: Optional[list[int]] = None
 
@@ -129,13 +118,6 @@ class GrantUsersIn(BaseModel):
 class GrantGroupsIn(BaseModel):
     lesson_id: int
     group_ids: list[int]
-
-class MemberOut(BaseModel):
-    tg_id: int
-    username: Optional[str] = None
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    avatar_url: Optional[str] = None
 
 class UserProfileOut(BaseModel):
     tg_id: int
@@ -153,17 +135,14 @@ class GroupMemberIn(BaseModel):
     tg_id: int
 
 class GroupCreateIn(BaseModel):
-    code: str
     name: str
-
 
 # ---------- Endpoints ----------
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "message": "Сервер работает"}
 
-
-# Users — admin|teacher: список c ролями/группами
+# Users — admin|teacher
 @app.get("/api/users", dependencies=[Depends(require_roles("admin", "teacher"))])
 async def list_users(session: AsyncSession = Depends(get_session)):
     users = await users_repo.list_users_with_details(session)
@@ -179,8 +158,7 @@ async def list_users(session: AsyncSession = Depends(get_session)):
         } for u in users
     ]
 
-
-# Ensure user -> возвратим полный профиль
+# Ensure user → профиль
 @app.post("/api/user/ensure", response_model=UserProfileOut)
 async def api_ensure_user(data: EnsureUserIn, session: AsyncSession = Depends(get_session)):
     await users_repo.ensure_user(
@@ -203,8 +181,7 @@ async def api_ensure_user(data: EnsureUserIn, session: AsyncSession = Depends(ge
         groups=[{"id": g.id, "name": g.name} for g in prof.groups],
     )
 
-
-# Профиль пользователя
+# Профиль
 @app.get("/api/user/profile/{tg_id}", response_model=UserProfileOut)
 async def get_user_profile(tg_id: int, session: AsyncSession = Depends(get_session)):
     user = await users_repo.get_user_profile(session, tg_id)
@@ -219,7 +196,6 @@ async def get_user_profile(tg_id: int, session: AsyncSession = Depends(get_sessi
         roles=[r.code for r in user.roles],
         groups=[{"id": g.id, "name": g.name} for g in user.groups],
     )
-
 
 # Subjects
 @app.get("/api/subjects", response_model=list[SubjectOut])
@@ -243,20 +219,13 @@ async def create_subject(payload: SubjectCreateIn, session: AsyncSession = Depen
     await session.commit()
     return SubjectOut(id=subj.id, code=subj.code, name=subj.name, description=subj.description)
 
-
 # Lessons
 @app.post("/api/lessons", response_model=LessonOut, status_code=status.HTTP_201_CREATED)
 async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends(get_session)):
-    created_by_id = None
-    if payload.created_by_tg is not None:
-        creator = await users_repo.ensure_user(session, payload.created_by_tg)
-        created_by_id = creator.id
-
     blocks = [
         {"type": b.type, "text": b.text, "image_url": b.image_url, "caption": b.caption}
         for b in payload.blocks
     ]
-
     try:
         lesson = await lessons_repo.create_lesson(
             session,
@@ -264,31 +233,25 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
             title=payload.title,
             blocks=blocks,
             publish=payload.publish,
-            created_by=created_by_id,
         )
     except lessons_repo.SubjectNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except lessons_repo.PayloadInvalidError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # ← НОВОЕ: сразу выдаём доступ урока
+    # сразу выдаём доступ
     if payload.group_ids:
-        await lessons_repo.grant_access_to_groups(
-            session, lesson_id=lesson.id, group_ids=payload.group_ids
-        )
+        await lessons_repo.grant_access_to_groups(session, lesson_id=lesson.id, group_ids=payload.group_ids)
 
     if payload.user_tg_ids:
         user_ids: list[int] = []
         for tg in payload.user_tg_ids:
             u = await users_repo.ensure_user(session, tg)
             user_ids.append(u.id)
-        await lessons_repo.grant_access_to_users(
-            session, lesson_id=lesson.id, user_ids=user_ids
-        )
+        await lessons_repo.grant_access_to_users(session, lesson_id=lesson.id, user_ids=user_ids)
 
     await session.commit()
     return LessonOut(id=lesson.id, subject_id=lesson.subject_id, title=lesson.title)
-
 
 @app.get("/api/lessons/accessible/{tg_id}", response_model=list[LessonOut])
 async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session)):
@@ -297,7 +260,6 @@ async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_ses
         raise HTTPException(status_code=404, detail="User not found")
     lessons = await lessons_repo.get_accessible_lessons_for_user(session, user_id=user.id)
     return [LessonOut(id=l.id, subject_id=l.subject_id, title=l.title) for l in lessons]
-
 
 # Access grants
 @app.post("/api/access/grant/users")
@@ -317,7 +279,6 @@ async def grant_access_groups(body: GrantGroupsIn, session: AsyncSession = Depen
     updated = await lessons_repo.grant_access_to_groups(session, lesson_id=body.lesson_id, group_ids=body.group_ids)
     await session.commit()
     return {"updated": updated}
-
 
 # Roles (admin|teacher)
 @app.get("/api/roles", dependencies=[Depends(require_roles("admin", "teacher"))])
@@ -355,7 +316,6 @@ async def remove_role_member(role: str, tg_id: int, session: AsyncSession = Depe
         raise HTTPException(status_code=404, detail="User not found")
     await session.commit()
     return {"status": "ok"}
-
 
 # Groups (admin|teacher)
 @app.get("/api/groups", dependencies=[Depends(require_roles("admin", "teacher"))])
@@ -396,9 +356,8 @@ async def remove_group_member(group_id: int, tg_id: int, session: AsyncSession =
 @app.post("/api/groups", dependencies=[Depends(require_roles("admin", "teacher"))], status_code=201)
 async def create_group(body: GroupCreateIn, session: AsyncSession = Depends(get_session)):
     try:
-        g = await users_repo.create_group(session, code=body.code, name=body.name)
+        g = await users_repo.create_group(session, name=body.name)
     except users_repo.GroupAlreadyExistsError:
-        raise HTTPException(status_code=409, detail="Group code already exists")
+        raise HTTPException(status_code=409, detail="Group already exists")
     await session.commit()
-    return {"id": g.id, "code": g.code, "name": g.name}
-
+    return {"id": g.id, "name": g.name}

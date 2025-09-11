@@ -9,13 +9,8 @@ from models import (
     Group, GroupMember,
 )
 
-# Репо-исключения, которые ловит main.py
-class SubjectNotFoundError(Exception):
-    pass
-
-class PayloadInvalidError(Exception):
-    pass
-
+class SubjectNotFoundError(Exception): ...
+class PayloadInvalidError(Exception): ...
 
 async def create_lesson(
     session: AsyncSession,
@@ -24,14 +19,11 @@ async def create_lesson(
     title: str,
     blocks: Sequence[dict],
     publish: bool = True,
-    created_by: int | None = None,
 ) -> "Lesson":
-    # 1) предмет существует?
     subj = await session.get(Subject, subject_id)
     if not subj:
         raise SubjectNotFoundError("Subject not found")
 
-    # 2) валидация блоков (defense-in-depth)
     for i, b in enumerate(blocks, start=1):
         t = b.get("type")
         if t not in ("text", "image"):
@@ -45,26 +37,20 @@ async def create_lesson(
         subject_id=subject_id,
         title=title,
         status="published" if publish else "draft",
-        published_at=func.datetime("now") if publish else None,  # SQLite-friendly
-        created_by=created_by,
-        updated_by=created_by,
     )
     session.add(lesson)
-    await session.flush()  # получим lesson.id
+    await session.flush()
 
-    # Поле модели называется 'text' (не text_content)
     for i, b in enumerate(blocks, start=1):
         session.add(LessonBlock(
             lesson_id=lesson.id,
-            type=b["type"],           # 'text' | 'image'
+            type=b["type"],
             position=i,
             text=b.get("text"),
             image_url=b.get("image_url"),
             caption=b.get("caption"),
         ))
-
     return lesson
-
 
 async def grant_access_to_users(session: AsyncSession, *, lesson_id: int, user_ids: Sequence[int]) -> int:
     if not user_ids:
@@ -73,23 +59,18 @@ async def grant_access_to_users(session: AsyncSession, *, lesson_id: int, user_i
         session.merge(LessonAccessUser(lesson_id=lesson_id, user_id=uid))
     return len(user_ids)
 
-
 async def grant_access_to_groups(session: AsyncSession, *, lesson_id: int, group_ids: Sequence[int]) -> int:
     if not group_ids:
         return 0
-    # проверим, что группы существуют
     res = await session.execute(select(Group.id).where(Group.id.in_(group_ids)))
     valid_ids = [gid for (gid,) in res.all()]
     for gid in valid_ids:
         session.merge(LessonAccessGroup(lesson_id=lesson_id, group_id=gid))
     return len(valid_ids)
 
-
 async def get_accessible_lessons_for_user(session: AsyncSession, *, user_id: int) -> list["Lesson"]:
-    # группы пользователя
     user_groups = select(GroupMember.group_id).where(GroupMember.user_id == user_id)
 
-    # персональный доступ
     user_access_exists = select(literal(1)).where(
         and_(
             LessonAccessUser.lesson_id == Lesson.id,
@@ -98,12 +79,10 @@ async def get_accessible_lessons_for_user(session: AsyncSession, *, user_id: int
         )
     ).exists()
 
-    # доступ через группы
     group_access_exists = select(literal(1)).where(
         and_(
             LessonAccessGroup.lesson_id == Lesson.id,
             LessonAccessGroup.group_id.in_(user_groups),
-            or_(LessonAccessGroup.expires_at.is_(None), LessonAccessGroup.expires_at > func.datetime("now")),
         )
     ).exists()
 
@@ -111,12 +90,10 @@ async def get_accessible_lessons_for_user(session: AsyncSession, *, user_id: int
         select(Lesson)
         .where(Lesson.status == "published")
         .where(or_(user_access_exists, group_access_exists))
-        .order_by(func.coalesce(Lesson.published_at, Lesson.created_at).desc())
+        .order_by(Lesson.id.desc())
     )
     res = await session.execute(stmt)
     return res.scalars().all()
 
-
 async def get_lesson_with_blocks(session: AsyncSession, lesson_id: int) -> "Lesson | None":
-    # блоки подтянутся через relationship(order_by position)
     return await session.get(Lesson, lesson_id)

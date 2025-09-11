@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional, List
 
 from sqlalchemy import (
-    Integer, SmallInteger, String, Text, Boolean, DateTime, Enum,
+    Integer, String, Text, Boolean, DateTime, Enum,
     ForeignKey, UniqueConstraint, Index, CheckConstraint, func, text, event, select
 )
 from sqlalchemy import BigInteger as SA_BigInteger
@@ -41,13 +41,21 @@ BlockTypeEnum = Enum(
     validate_strings=True,
 )
 
-# ---------- Common column helpers ----------
+# ---------- Common ----------
 PK_INT = Integer
 FK_INT = Integer
 
 
 # ---------- Mixins ----------
+class CreatedAtMixin:
+    """Только created_at (без updated_at)."""
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), server_default=func.datetime("now"), nullable=False
+    )
+
+
 class TimestampMixin:
+    """created_at + updated_at (оставлен для тех таблиц, где нужен)."""
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), server_default=func.datetime("now"), nullable=False
     )
@@ -58,7 +66,7 @@ class TimestampMixin:
 
 
 # ---------- Models ----------
-class User(TimestampMixin, Base):
+class User(CreatedAtMixin, Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(PK_INT, primary_key=True)
@@ -85,8 +93,8 @@ class User(TimestampMixin, Base):
 
 class Role(Base):
     __tablename__ = "roles"
-    # было: SmallInteger
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)  # ✅ INTEGER PRIMARY KEY
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)   # INTEGER PRIMARY KEY (SQLite autoincrement)
     code: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String, nullable=False)
 
@@ -97,18 +105,25 @@ class UserRole(Base):
     __tablename__ = "user_roles"
 
     user_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
-    role_id: Mapped[int] = mapped_column(SmallInteger, ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True)
+    role_id: Mapped[int] = mapped_column(Integer, ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True)
 
 
-class Group(TimestampMixin, Base):
+class Group(Base):
     __tablename__ = "groups"
 
     id: Mapped[int] = mapped_column(PK_INT, primary_key=True)
-    code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    # code удалён
     name: Mapped[str] = mapped_column(String(255), nullable=False)
 
-    members: Mapped[List[User]] = relationship("User", secondary="group_members", back_populates="groups", lazy="selectin")
-    lesson_access: Mapped[List["LessonAccessGroup"]] = relationship("LessonAccessGroup", back_populates="group")
+    members: Mapped[List["User"]] = relationship(
+        "User", secondary="group_members", back_populates="groups", lazy="selectin"
+    )
+    lessons: Mapped[List["Lesson"]] = relationship(
+        "Lesson", back_populates="group", lazy="selectin"
+    )
+    lesson_access: Mapped[List["LessonAccessGroup"]] = relationship(
+        "LessonAccessGroup", back_populates="group"
+    )
 
 
 class GroupMember(Base):
@@ -116,8 +131,7 @@ class GroupMember(Base):
 
     group_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True)
     user_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
-    role_in_group: Mapped[Optional[str]] = mapped_column(String)
-    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), server_default=func.datetime("now"), nullable=False)
+    # role_in_group, added_at удалены
 
     __table_args__ = (Index("idx_group_members_user", "user_id"),)
 
@@ -131,31 +145,32 @@ class Subject(TimestampMixin, Base):
     description: Mapped[Optional[str]] = mapped_column(Text)
 
     created_by: Mapped[Optional[int]] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="SET NULL"))
-    created_by_user: Mapped[Optional[User]] = relationship("User", back_populates="created_subjects")
+    created_by_user: Mapped[Optional["User"]] = relationship("User", back_populates="created_subjects")
 
     lessons: Mapped[List["Lesson"]] = relationship(
         "Lesson", back_populates="subject", cascade="all, delete-orphan", lazy="selectin"
     )
 
 
-class Lesson(TimestampMixin, Base):
+class Lesson(Base):
     __tablename__ = "lessons"
 
     id: Mapped[int] = mapped_column(PK_INT, primary_key=True)
     subject_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(LessonStatusEnum, nullable=False, server_default=text("'draft'"))
-    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=False))
+    # published_at / created_by / updated_by / created_at / updated_at — удалены
 
-    created_by: Mapped[Optional[int]] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="SET NULL"))
-    updated_by: Mapped[Optional[int]] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="SET NULL"))
+    # Новая привязка урока к группе (опционально)
+    group_id: Mapped[Optional[int]] = mapped_column(FK_INT, ForeignKey("groups.id", ondelete="SET NULL"))
+    group: Mapped[Optional["Group"]] = relationship("Group", back_populates="lessons")
 
-    subject: Mapped[Subject] = relationship("Subject", back_populates="lessons")
+    subject: Mapped["Subject"] = relationship("Subject", back_populates="lessons")
     blocks: Mapped[List["LessonBlock"]] = relationship(
         "LessonBlock", back_populates="lesson",
         cascade="all, delete-orphan",
         order_by="LessonBlock.position",
-        lazy="selectin"
+        lazy="selectin",
     )
     access_users: Mapped[List["LessonAccessUser"]] = relationship(
         "LessonAccessUser", back_populates="lesson", cascade="all, delete-orphan"
@@ -166,7 +181,10 @@ class Lesson(TimestampMixin, Base):
     views: Mapped[List["LessonView"]] = relationship("LessonView", back_populates="lesson")
     bookmarks: Mapped[List["Bookmark"]] = relationship("Bookmark", back_populates="lesson")
 
-    __table_args__ = (Index("idx_lessons_subject", "subject_id"),)
+    __table_args__ = (
+        Index("idx_lessons_subject", "subject_id"),
+        Index("idx_lessons_group", "group_id"),
+    )
 
 
 class LessonBlock(TimestampMixin, Base):
@@ -201,8 +219,8 @@ class LessonAccessUser(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), server_default=func.datetime("now"), nullable=False)
 
     lesson: Mapped["Lesson"] = relationship("Lesson", back_populates="access_users")
-    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])                       # ✅ фикс
-    granted_by_user: Mapped[Optional["User"]] = relationship("User", foreign_keys=[granted_by])  # ✅ фикс
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+    granted_by_user: Mapped[Optional["User"]] = relationship("User", foreign_keys=[granted_by])
 
     __table_args__ = (
         Index("idx_access_users_user", "user_id"),
@@ -215,13 +233,10 @@ class LessonAccessGroup(Base):
 
     lesson_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("lessons.id", ondelete="CASCADE"), primary_key=True)
     group_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("groups.id", ondelete="CASCADE"), primary_key=True)
-    granted_by: Mapped[Optional[int]] = mapped_column(FK_INT, ForeignKey("users.id", ondelete="SET NULL"))
-    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=False))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=False), server_default=func.datetime("now"), nullable=False)
+    # granted_by / expires_at / created_at — удалены
 
     lesson: Mapped["Lesson"] = relationship("Lesson", back_populates="access_groups")
     group: Mapped["Group"] = relationship("Group", back_populates="lesson_access")
-    granted_by_user: Mapped[Optional["User"]] = relationship("User", foreign_keys=[granted_by])  # ✅ фикс
 
     __table_args__ = (
         Index("idx_access_groups_group", "group_id"),
@@ -262,14 +277,14 @@ async def seed_initial_data(session: AsyncSession) -> None:
 
     await session.flush()
 
-    # Группы
-    g1 = await session.scalar(select(Group).where(Group.code == "11-IS"))
+    # Группы (по имени, т.к. поля code больше нет)
+    g1 = await session.scalar(select(Group).where(Group.name == "Группа 11-ИС"))
     if not g1:
-        g1 = Group(code="11-IS", name="Группа 11-ИС")
+        g1 = Group(name="Группа 11-ИС")
         session.add(g1)
-    g2 = await session.scalar(select(Group).where(Group.code == "FE-COURSE"))
+    g2 = await session.scalar(select(Group).where(Group.name == "Frontend-курс"))
     if not g2:
-        g2 = Group(code="FE-COURSE", name="Frontend-курс")
+        g2 = Group(name="Frontend-курс")
         session.add(g2)
 
     await session.flush()
@@ -281,15 +296,16 @@ async def seed_initial_data(session: AsyncSession) -> None:
         session.add(subj)
         await session.flush()
 
-        # Пример урока с блоками
+        # Пример урока с блоками (без published_at, но со статусом 'published')
         lesson = Lesson(
             subject_id=subj.id,
             title="Урок 1. Множества",
             status="published",
-            published_at=func.datetime("now"),
+            group_id=g1.id,  # пример привязки к группе
         )
         session.add(lesson)
         await session.flush()
+
         session.add_all([
             LessonBlock(lesson_id=lesson.id, type="text", position=1, text="Что такое множество? Базовые определения."),
             LessonBlock(lesson_id=lesson.id, type="image", position=2, image_url="https://placehold.co/600x400", caption="Диаграмма Венна"),
@@ -300,7 +316,6 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # после создания схемы — сид
     async with async_session() as session:
         await seed_initial_data(session)
         await session.commit()
