@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +12,39 @@ from repositories import users as users_repo
 from repositories import subjects as subjects_repo
 from repositories import lessons as lessons_repo
 
+async def get_session() -> AsyncIterator[AsyncSession]:
+    async with async_session() as session:
+        yield session
+
+
+async def get_current_user(
+    session: AsyncSession = Depends(get_session),
+    x_debug_tg_id: Optional[int] = Header(None, alias="X-Debug-Tg-Id"),
+):
+    """
+    DEV-версия авторизации: берём пользователя по заголовку X-Debug-Tg-Id.
+    Для продакшена сюда легко подставить разбор и валидацию X-Telegram-Init-Data.
+    """
+    if not x_debug_tg_id:
+        raise HTTPException(status_code=401, detail="Missing X-Debug-Tg-Id")
+    user = await users_repo.get_user_by_tg(session, x_debug_tg_id)
+    if not user:
+        # если прям совсем нет — создадим (и выдадим роль student автоматически)
+        user = await users_repo.ensure_user(session, x_debug_tg_id)
+        await session.commit()
+    return user
+
+def require_roles(*allowed: str):
+    async def checker(
+        session: AsyncSession = Depends(get_session),
+        me = Depends(get_current_user),
+    ):
+        prof = await users_repo.get_user_profile(session, me.telegram_id)
+        codes = {r.code for r in prof.roles} if prof else set()
+        if not (set(allowed) & codes):
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return prof
+    return checker
 
 # ---------- Lifespan ----------
 @asynccontextmanager
@@ -135,13 +168,45 @@ class AddRoleIn(BaseModel):
 class AddGroupIn(BaseModel):
     group_id: int
 
+class MemberOut(BaseModel):
+    tg_id: int
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+class UserProfileOut(BaseModel):
+    tg_id: int
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+    roles: list[str]
+    groups: list[dict]
+
 # ---------- Endpoints ----------
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "message": "Сервер работает"}
 
 
-@app.post("/api/user/ensure")
+@app.get("/api/users", dependencies=[Depends(require_roles("admin", "teacher"))])
+async def list_users(session: AsyncSession = Depends(get_session)):
+    users = await users_repo.list_users_with_details(session)
+    return [
+        {
+            "tg_id": u.telegram_id,
+            "username": u.username,
+            "first_name": u.first_name,
+            "last_name": u.last_name,
+            "avatar_url": u.avatar_url,
+            "roles": [r.code for r in u.roles],
+            "groups": [{"id": g.id, "name": g.name} for g in u.groups],
+        } for u in users
+    ]
+
+
+@app.post("/api/user/ensure", response_model=UserProfileOut)
 async def api_ensure_user(data: EnsureUserIn, session: AsyncSession = Depends(get_session)):
     user = await users_repo.ensure_user(
         session,
@@ -152,7 +217,16 @@ async def api_ensure_user(data: EnsureUserIn, session: AsyncSession = Depends(ge
         avatar_url=data.avatar_url,
     )
     await session.commit()
-    return {"id": user.id, "tg_id": user.telegram_id}
+    prof = await users_repo.get_user_profile(session, data.tg_id)
+    return UserProfileOut(
+        tg_id=prof.telegram_id,
+        username=prof.username,
+        first_name=prof.first_name,
+        last_name=prof.last_name,
+        avatar_url=prof.avatar_url,
+        roles=[r.code for r in prof.roles],
+        groups=[{"id": g.id, "name": g.name} for g in prof.groups],
+    )
 
 
 @app.get("/api/users", response_model=list[UserOut])
@@ -176,12 +250,12 @@ async def get_user_profile(tg_id: int, session: AsyncSession = Depends(get_sessi
     user = await users_repo.get_user_profile(session, tg_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-
     return UserProfileOut(
         tg_id=user.telegram_id,
         username=user.username,
         first_name=user.first_name,
         last_name=user.last_name,
+        avatar_url=user.avatar_url,
         roles=[r.code for r in user.roles],
         groups=[{"id": g.id, "name": g.name} for g in user.groups],
     )
@@ -284,3 +358,75 @@ async def grant_access_groups(body: GrantGroupsIn, session: AsyncSession = Depen
     updated = await lessons_repo.grant_access_to_groups(session, lesson_id=body.lesson_id, group_ids=body.group_ids)
     await session.commit()
     return {"updated": updated}
+
+
+@app.get("/api/roles", dependencies=[Depends(require_roles("admin", "teacher"))])
+async def list_roles(session: AsyncSession = Depends(get_session)):
+    rows = await users_repo.list_roles_with_members(session)
+    return [
+        {
+            "key": role.code,
+            "title": role.name,
+            "members": [
+                {
+                    "tg_id": u.telegram_id,
+                    "first_name": u.first_name,
+                    "last_name": u.last_name,
+                    "username": u.username,
+                    "avatar_url": u.avatar_url,
+                } for u in members
+            ],
+        }
+        for role, members in rows
+    ]
+
+@app.post("/api/roles/{role}/members", dependencies=[Depends(require_roles("admin", "teacher"))])
+async def add_role_member(role: str, body: AddGroupIn, session: AsyncSession = Depends(get_session)):
+    ok = await users_repo.add_role_to_user(session, body.tg_id, role)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found")
+    await session.commit()
+    return {"status": "ok"}
+
+@app.delete("/api/roles/{role}/members/{tg_id}", dependencies=[Depends(require_roles("admin", "teacher"))])
+async def remove_role_member(role: str, tg_id: int, session: AsyncSession = Depends(get_session)):
+    ok = await users_repo.remove_role_from_user(session, tg_id, role)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found")
+    await session.commit()
+    return {"status": "ok"}
+
+@app.get("/api/groups", dependencies=[Depends(require_roles("admin", "teacher"))])
+async def list_groups(session: AsyncSession = Depends(get_session)):
+    groups = await users_repo.list_groups_with_members(session)
+    return [
+        {
+            "id": g.id,
+            "name": g.name,
+            "members": [
+                {
+                    "tg_id": u.telegram_id,
+                    "first_name": u.first_name,
+                    "last_name": u.last_name,
+                    "username": u.username,
+                    "avatar_url": u.avatar_url,
+                } for u in g.members
+            ],
+        } for g in groups
+    ]
+
+@app.post("/api/groups/{group_id}/members", dependencies=[Depends(require_roles("admin", "teacher"))])
+async def add_group_member(group_id: int, body: AddGroupIn, session: AsyncSession = Depends(get_session)):
+    ok = await users_repo.add_user_to_group(session, body.tg_id, group_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User or group not found")
+    await session.commit()
+    return {"status": "ok"}
+
+@app.delete("/api/groups/{group_id}/members/{tg_id}", dependencies=[Depends(require_roles("admin", "teacher"))])
+async def remove_group_member(group_id: int, tg_id: int, session: AsyncSession = Depends(get_session)):
+    ok = await users_repo.remove_user_from_group(session, tg_id, group_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User or group not found")
+    await session.commit()
+    return {"status": "ok"}

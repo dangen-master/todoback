@@ -1,6 +1,6 @@
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -144,3 +144,54 @@ async def add_user_to_group(session: AsyncSession, tg_id: int, group_id: int) ->
 
     session.add(GroupMember(user_id=user.id, group_id=group_id))
     return True
+
+
+async def remove_role_from_user(session: AsyncSession, tg_id: int, role_code: str) -> bool:
+    user = await session.scalar(select(User).where(User.telegram_id == tg_id))
+    if not user:
+        return False
+    role = await session.scalar(select(Role).where(Role.code == role_code))
+    if not role:
+        return True  # нет роли — считать "уже удалено"
+    await session.execute(
+        delete(UserRole).where(UserRole.user_id == user.id, UserRole.role_id == role.id)
+    )
+    return True
+
+async def remove_user_from_group(session: AsyncSession, tg_id: int, group_id: int) -> bool:
+    user = await session.scalar(select(User).where(User.telegram_id == tg_id))
+    if not user:
+        return False
+    await session.execute(
+        delete(GroupMember).where(GroupMember.user_id == user.id, GroupMember.group_id == group_id)
+    )
+    return True
+
+async def list_users_with_details(session: AsyncSession) -> list[User]:
+    res = await session.execute(
+        select(User)
+        .options(selectinload(User.roles), selectinload(User.groups))
+        .order_by(User.id.asc())
+    )
+    return res.scalars().all()
+
+async def list_roles_with_members(session: AsyncSession) -> list[tuple[Role, list[User]]]:
+    """Вернёт роли и их участников (как пары Role, [User])."""
+    roles = await session.execute(select(Role).order_by(Role.code.asc()))
+    roles = roles.scalars().all()
+    result: list[tuple[Role, list[User]]] = []
+    for r in roles:
+        users = await session.execute(
+            select(User)
+            .join(UserRole, UserRole.user_id == User.id)
+            .where(UserRole.role_id == r.id)
+            .order_by(User.first_name.nulls_last(), User.last_name.nulls_last(), User.username.nulls_last())
+        )
+        result.append((r, users.scalars().all()))
+    return result
+
+async def list_groups_with_members(session: AsyncSession) -> list[Group]:
+    res = await session.execute(
+        select(Group).options(selectinload(Group.members)).order_by(Group.name.asc())
+    )
+    return res.scalars().all()
