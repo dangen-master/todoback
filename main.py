@@ -4,7 +4,7 @@ from typing import Optional, Callable, Awaitable, Any
 
 from fastapi import FastAPI, Depends, HTTPException, status, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, FieldValidationInfo
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import async_session, init_db
@@ -96,16 +96,14 @@ class LessonBlockIn(BaseModel):
     caption: Optional[str] = None
 
     @field_validator("text")
-    @classmethod
-    def validate_text_for_type(cls, v, info):
-        if info.data.get("type") == "text" and not v:
+    def validate_text_for_type(cls, v, info: FieldValidationInfo):
+        if (info.data or {}).get("type") == "text" and not v:
             raise ValueError("text is required when type='text'")
         return v
 
     @field_validator("image_url")
-    @classmethod
-    def validate_image_for_type(cls, v, info):
-        if info.data.get("type") == "image" and not v:
+    def validate_image_for_type(cls, v, info: FieldValidationInfo):
+        if (info.data or {}).get("type") == "image" and not v:
             raise ValueError("image_url is required when type='image'")
         return v
 
@@ -115,6 +113,9 @@ class LessonCreateIn(BaseModel):
     publish: bool = True
     blocks: list[LessonBlockIn]
     created_by_tg: Optional[int] = None
+    # новые поля: сразу выдать доступ после создания
+    group_ids: Optional[list[int]] = None
+    user_tg_ids: Optional[list[int]] = None
 
 class LessonOut(BaseModel):
     id: int
@@ -150,6 +151,10 @@ class RoleMemberIn(BaseModel):
 
 class GroupMemberIn(BaseModel):
     tg_id: int
+
+class GroupCreateIn(BaseModel):
+    code: str
+    name: str
 
 
 # ---------- Endpoints ----------
@@ -266,8 +271,24 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
     except lessons_repo.PayloadInvalidError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # ← НОВОЕ: сразу выдаём доступ урока
+    if payload.group_ids:
+        await lessons_repo.grant_access_to_groups(
+            session, lesson_id=lesson.id, group_ids=payload.group_ids
+        )
+
+    if payload.user_tg_ids:
+        user_ids: list[int] = []
+        for tg in payload.user_tg_ids:
+            u = await users_repo.ensure_user(session, tg)
+            user_ids.append(u.id)
+        await lessons_repo.grant_access_to_users(
+            session, lesson_id=lesson.id, user_ids=user_ids
+        )
+
     await session.commit()
     return LessonOut(id=lesson.id, subject_id=lesson.subject_id, title=lesson.title)
+
 
 @app.get("/api/lessons/accessible/{tg_id}", response_model=list[LessonOut])
 async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session)):
@@ -371,3 +392,13 @@ async def remove_group_member(group_id: int, tg_id: int, session: AsyncSession =
         raise HTTPException(status_code=404, detail="User or group not found")
     await session.commit()
     return {"status": "ok"}
+
+@app.post("/api/groups", dependencies=[Depends(require_roles("admin", "teacher"))], status_code=201)
+async def create_group(body: GroupCreateIn, session: AsyncSession = Depends(get_session)):
+    try:
+        g = await users_repo.create_group(session, code=body.code, name=body.name)
+    except users_repo.GroupAlreadyExistsError:
+        raise HTTPException(status_code=409, detail="Group code already exists")
+    await session.commit()
+    return {"id": g.id, "code": g.code, "name": g.name}
+

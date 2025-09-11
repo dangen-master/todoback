@@ -94,6 +94,8 @@ async def list_users(session: AsyncSession) -> list[User]:
     result = await session.execute(select(User).order_by(User.id))
     return result.scalars().all()
 
+class GroupAlreadyExistsError(Exception):
+    pass
 
 async def get_user_profile(session: AsyncSession, tg_id: int) -> User | None:
     return await session.scalar(
@@ -195,3 +197,12 @@ async def list_groups_with_members(session: AsyncSession) -> list[Group]:
         select(Group).options(selectinload(Group.members)).order_by(Group.name.asc())
     )
     return res.scalars().all()
+
+async def create_group(session: AsyncSession, *, code: str, name: str) -> Group:
+    exists = await session.scalar(select(Group).where(Group.code == code))
+    if exists:
+        raise GroupAlreadyExistsError("Group code already exists")
+    g = Group(code=code, name=name)
+    session.add(g)
+    await session.flush()
+    return g
