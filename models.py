@@ -85,12 +85,12 @@ class User(TimestampMixin, Base):
 
 class Role(Base):
     __tablename__ = "roles"
-
-    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    # было: SmallInteger
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)  # ✅ INTEGER PRIMARY KEY
     code: Mapped[str] = mapped_column(String, unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String, nullable=False)
 
-    users: Mapped[List[User]] = relationship("User", secondary="user_roles", back_populates="roles")
+    users: Mapped[List["User"]] = relationship("User", secondary="user_roles", back_populates="roles")
 
 
 class UserRole(Base):
