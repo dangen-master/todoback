@@ -128,6 +128,12 @@ class UserProfileOut(BaseModel):
     class Config:
         from_attributes = True
 
+class AddRoleIn(BaseModel):
+    role: str
+
+
+class AddGroupIn(BaseModel):
+    group_id: int
 
 # ---------- Endpoints ----------
 @app.get("/api/health")
@@ -179,6 +185,22 @@ async def get_user_profile(tg_id: int, session: AsyncSession = Depends(get_sessi
         roles=[r.code for r in user.roles],
         groups=[{"id": g.id, "name": g.name} for g in user.groups],
     )
+
+@app.post("/api/user/{tg_id}/roles")
+async def add_role(tg_id: int, body: AddRoleIn, session: AsyncSession = Depends(get_session)):
+    ok = await users_repo.add_role_to_user(session, tg_id, body.role)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found")
+    await session.commit()
+    return {"status": "ok", "role": body.role}
+
+@app.post("/api/user/{tg_id}/groups")
+async def add_group(tg_id: int, body: AddGroupIn, session: AsyncSession = Depends(get_session)):
+    ok = await users_repo.add_user_to_group(session, tg_id, body.group_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User or group not found")
+    await session.commit()
+    return {"status": "ok", "group_id": body.group_id}
 
 
 @app.get("/api/subjects", response_model=list[SubjectOut])

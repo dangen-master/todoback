@@ -3,11 +3,11 @@ from typing import Optional, List
 
 from sqlalchemy import (
     Integer, SmallInteger, String, Text, Boolean, DateTime, Enum,
-    ForeignKey, UniqueConstraint, Index, CheckConstraint, func, text, event
+    ForeignKey, UniqueConstraint, Index, CheckConstraint, func, text, event, select
 )
 from sqlalchemy import BigInteger as SA_BigInteger
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine, AsyncSession
 
 # ---------- Async engine (SQLite dev) ----------
 engine = create_async_engine("sqlite+aiosqlite:///db.sqlite3", echo=True)
@@ -252,6 +252,55 @@ class Bookmark(Base):
 
 
 # ---------- Schema init ----------
+async def seed_initial_data(session: AsyncSession) -> None:
+    # Роли
+    roles = [("student", "Student"), ("teacher", "Teacher"), ("admin", "Admin")]
+    for code, name in roles:
+        exists = await session.scalar(select(Role).where(Role.code == code))
+        if not exists:
+            session.add(Role(code=code, name=name))
+
+    await session.flush()
+
+    # Группы
+    g1 = await session.scalar(select(Group).where(Group.code == "11-IS"))
+    if not g1:
+        g1 = Group(code="11-IS", name="Группа 11-ИС")
+        session.add(g1)
+    g2 = await session.scalar(select(Group).where(Group.code == "FE-COURSE"))
+    if not g2:
+        g2 = Group(code="FE-COURSE", name="Frontend-курс")
+        session.add(g2)
+
+    await session.flush()
+
+    # Предмет
+    subj = await session.scalar(select(Subject).where(Subject.code == "ALG-101"))
+    if not subj:
+        subj = Subject(code="ALG-101", name="Алгебра", description="Базовый курс алгебры")
+        session.add(subj)
+        await session.flush()
+
+        # Пример урока с блоками
+        lesson = Lesson(
+            subject_id=subj.id,
+            title="Урок 1. Множества",
+            status="published",
+            published_at=func.datetime("now"),
+        )
+        session.add(lesson)
+        await session.flush()
+        session.add_all([
+            LessonBlock(lesson_id=lesson.id, type="text", position=1, text="Что такое множество? Базовые определения."),
+            LessonBlock(lesson_id=lesson.id, type="image", position=2, image_url="https://placehold.co/600x400", caption="Диаграмма Венна"),
+        ])
+
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # после создания схемы — сид
+    async with async_session() as session:
+        await seed_initial_data(session)
+        await session.commit()
