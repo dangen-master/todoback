@@ -1,12 +1,11 @@
 from typing import Sequence
-
 from sqlalchemy import select, func, and_, or_, literal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import (
     Lesson, LessonBlock, Subject,
     LessonAccessUser, LessonAccessGroup,
-    Group, GroupMember,
+    Group, GroupMember, SubjectAccessGroup,
 )
 
 class SubjectNotFoundError(Exception): ...
@@ -19,6 +18,7 @@ async def create_lesson(
     title: str,
     blocks: Sequence[dict],
     publish: bool = True,
+    publish_at = None,  # datetime | None
 ) -> "Lesson":
     subj = await session.get(Subject, subject_id)
     if not subj:
@@ -37,6 +37,7 @@ async def create_lesson(
         subject_id=subject_id,
         title=title,
         status="published" if publish else "draft",
+        publish_at=publish_at,
     )
     session.add(lesson)
     await session.flush()
@@ -69,27 +70,38 @@ async def grant_access_to_groups(session: AsyncSession, *, lesson_id: int, group
     return len(valid_ids)
 
 async def get_accessible_lessons_for_user(session: AsyncSession, *, user_id: int) -> list["Lesson"]:
+    # группы пользователя
     user_groups = select(GroupMember.group_id).where(GroupMember.user_id == user_id)
 
+    # доступ через персональные выдачи
     user_access_exists = select(literal(1)).where(
-        and_(
-            LessonAccessUser.lesson_id == Lesson.id,
-            LessonAccessUser.user_id == user_id,
-            or_(LessonAccessUser.expires_at.is_(None), LessonAccessUser.expires_at > func.datetime("now")),
-        )
+        and_(LessonAccessUser.lesson_id == Lesson.id, LessonAccessUser.user_id == user_id)
     ).exists()
 
+    # доступ через выдачи группам
     group_access_exists = select(literal(1)).where(
-        and_(
-            LessonAccessGroup.lesson_id == Lesson.id,
-            LessonAccessGroup.group_id.in_(user_groups),
-        )
+        and_(LessonAccessGroup.lesson_id == Lesson.id, LessonAccessGroup.group_id.in_(user_groups))
     ).exists()
+
+    # доступ по прямой привязке урока к группе
+    lesson_group_match = select(literal(1)).where(
+        and_(Lesson.group_id.is_not(None), Lesson.group_id.in_(user_groups))
+    ).exists()
+
+    # доступ по привязке ПРЕДМЕТА к группам
+    subject_group_access = select(literal(1)).where(
+        and_(SubjectAccessGroup.subject_id == Lesson.subject_id,
+             SubjectAccessGroup.group_id.in_(user_groups))
+    ).exists()
+
+    # публикация: либо publish_at IS NULL, либо уже наступила
+    publish_ready = or_(Lesson.publish_at.is_(None), Lesson.publish_at <= func.datetime("now"))
 
     stmt = (
         select(Lesson)
         .where(Lesson.status == "published")
-        .where(or_(user_access_exists, group_access_exists))
+        .where(publish_ready)
+        .where(or_(user_access_exists, group_access_exists, lesson_group_match, subject_group_access))
         .order_by(Lesson.id.desc())
     )
     res = await session.execute(stmt)
