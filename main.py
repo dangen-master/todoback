@@ -108,6 +108,26 @@ class GrantGroupsIn(BaseModel):
     lesson_id: int
     group_ids: list[int]
 
+class UserOut(BaseModel):
+    id: int
+    tg_id: int | None = None
+    username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    avatar_url: str | None = None
+
+
+class UserProfileOut(BaseModel):
+    tg_id: int
+    username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    roles: list[str]
+    groups: list[dict]
+
+    class Config:
+        from_attributes = True
+
 
 # ---------- Endpoints ----------
 @app.get("/api/health")
@@ -127,6 +147,38 @@ async def api_ensure_user(data: EnsureUserIn, session: AsyncSession = Depends(ge
     )
     await session.commit()
     return {"id": user.id, "tg_id": user.telegram_id}
+
+
+@app.get("/api/users", response_model=list[UserOut])
+async def list_users(session: AsyncSession = Depends(get_session)):
+    users = await users_repo.list_users(session)
+    return [
+        UserOut(
+            id=u.id,
+            tg_id=u.telegram_id,
+            username=u.username,
+            first_name=u.first_name,
+            last_name=u.last_name,
+            avatar_url=u.avatar_url
+        )
+        for u in users
+    ]
+
+
+@app.get("/api/user/profile/{tg_id}", response_model=UserProfileOut)
+async def get_user_profile(tg_id: int, session: AsyncSession = Depends(get_session)):
+    user = await users_repo.get_user_profile(session, tg_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return UserProfileOut(
+        tg_id=user.telegram_id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        roles=[r.code for r in user.roles],
+        groups=[{"id": g.id, "name": g.name} for g in user.groups],
+    )
 
 
 @app.get("/api/subjects", response_model=list[SubjectOut])

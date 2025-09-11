@@ -2,6 +2,7 @@ from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from models import User
 
@@ -47,3 +48,17 @@ async def ensure_user(
 
 async def get_user_by_tg(session: AsyncSession, tg_id: int) -> User | None:
     return await session.scalar(select(User).where(User.telegram_id == tg_id))
+
+async def list_users(session: AsyncSession) -> list[User]:
+    result = await session.execute(select(User).order_by(User.id))
+    return result.scalars().all()
+
+async def get_user_profile(session: AsyncSession, tg_id: int) -> User | None:
+    return await session.scalar(
+        select(User)
+        .options(
+            selectinload(User.roles),
+            selectinload(User.groups),
+        )
+        .where(User.telegram_id == tg_id)
+    )
