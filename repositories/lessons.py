@@ -1,4 +1,4 @@
-from typing import List, Sequence
+from typing import Sequence
 
 from sqlalchemy import select, func, and_, or_, literal
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +9,13 @@ from models import (
     Group, GroupMember,
 )
 
+# Репо-исключения, которые ловит main.py
+class SubjectNotFoundError(Exception):
+    pass
+
+class PayloadInvalidError(Exception):
+    pass
+
 
 async def create_lesson(
     session: AsyncSession,
@@ -18,29 +25,40 @@ async def create_lesson(
     blocks: Sequence[dict],
     publish: bool = True,
     created_by: int | None = None,
-) -> Lesson:
-    # проверим предмет
+) -> "Lesson":
+    # 1) предмет существует?
     subj = await session.get(Subject, subject_id)
     if not subj:
-        raise ValueError("Subject not found")
+        raise SubjectNotFoundError("Subject not found")
+
+    # 2) валидация блоков (defense-in-depth)
+    for i, b in enumerate(blocks, start=1):
+        t = b.get("type")
+        if t not in ("text", "image"):
+            raise PayloadInvalidError(f"Block #{i}: invalid type {t!r}")
+        if t == "text" and not (b.get("text") and str(b.get("text")).strip()):
+            raise PayloadInvalidError(f"Block #{i}: 'text' is required for type='text'")
+        if t == "image" and not (b.get("image_url") and str(b.get("image_url")).strip()):
+            raise PayloadInvalidError(f"Block #{i}: 'image_url' is required for type='image'")
 
     lesson = Lesson(
         subject_id=subject_id,
         title=title,
         status="published" if publish else "draft",
-        published_at=func.now() if publish else None,
+        published_at=func.datetime("now") if publish else None,  # SQLite-friendly
         created_by=created_by,
         updated_by=created_by,
     )
     session.add(lesson)
     await session.flush()  # получим lesson.id
 
+    # Поле модели называется 'text' (не text_content)
     for i, b in enumerate(blocks, start=1):
         session.add(LessonBlock(
             lesson_id=lesson.id,
-            type=b["type"],                  # 'text' | 'image'
+            type=b["type"],           # 'text' | 'image'
             position=i,
-            text_content=b.get("text"),
+            text=b.get("text"),
             image_url=b.get("image_url"),
             caption=b.get("caption"),
         ))
@@ -59,7 +77,7 @@ async def grant_access_to_users(session: AsyncSession, *, lesson_id: int, user_i
 async def grant_access_to_groups(session: AsyncSession, *, lesson_id: int, group_ids: Sequence[int]) -> int:
     if not group_ids:
         return 0
-    # убедимся, что группы существуют (не обязательно, но полезно)
+    # проверим, что группы существуют
     res = await session.execute(select(Group.id).where(Group.id.in_(group_ids)))
     valid_ids = [gid for (gid,) in res.all()]
     for gid in valid_ids:
@@ -67,16 +85,16 @@ async def grant_access_to_groups(session: AsyncSession, *, lesson_id: int, group
     return len(valid_ids)
 
 
-async def get_accessible_lessons_for_user(session: AsyncSession, *, user_id: int) -> List[Lesson]:
+async def get_accessible_lessons_for_user(session: AsyncSession, *, user_id: int) -> list["Lesson"]:
     # группы пользователя
     user_groups = select(GroupMember.group_id).where(GroupMember.user_id == user_id)
 
-    # доступ персонально
+    # персональный доступ
     user_access_exists = select(literal(1)).where(
         and_(
             LessonAccessUser.lesson_id == Lesson.id,
             LessonAccessUser.user_id == user_id,
-            or_(LessonAccessUser.expires_at.is_(None), LessonAccessUser.expires_at > func.now()),
+            or_(LessonAccessUser.expires_at.is_(None), LessonAccessUser.expires_at > func.datetime("now")),
         )
     ).exists()
 
@@ -85,7 +103,7 @@ async def get_accessible_lessons_for_user(session: AsyncSession, *, user_id: int
         and_(
             LessonAccessGroup.lesson_id == Lesson.id,
             LessonAccessGroup.group_id.in_(user_groups),
-            or_(LessonAccessGroup.expires_at.is_(None), LessonAccessGroup.expires_at > func.now()),
+            or_(LessonAccessGroup.expires_at.is_(None), LessonAccessGroup.expires_at > func.datetime("now")),
         )
     ).exists()
 
@@ -99,6 +117,6 @@ async def get_accessible_lessons_for_user(session: AsyncSession, *, user_id: int
     return res.scalars().all()
 
 
-async def get_lesson_with_blocks(session: AsyncSession, lesson_id: int) -> Lesson | None:
-    # простая загрузка; блоки подхватятся из relationship(order_by position) при обращении
+async def get_lesson_with_blocks(session: AsyncSession, lesson_id: int) -> "Lesson | None":
+    # блоки подтянутся через relationship(order_by position)
     return await session.get(Lesson, lesson_id)
