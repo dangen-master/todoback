@@ -172,6 +172,14 @@ class LessonPatchIn(BaseModel):
 class GroupPatchIn(BaseModel):
     name: str
 
+class LessonListItemOut(BaseModel):
+    id: int
+    subject_id: int
+    title: str
+    status: str
+    publish_at: Optional[datetime] = None
+    group_ids: list[int]
+
 # ---------- Endpoints ----------
 @app.get("/api/health")
 async def health():
@@ -264,12 +272,23 @@ async def patch_subject(subject_id: int, body: SubjectPatchIn, session: AsyncSes
     s, gids = await subjects_repo.get_subject_with_group_ids(session, subject_id)
     return SubjectOutFull(id=s.id, name=s.name, description=s.description, group_ids=gids)
 
-@app.get("/api/subjects/{subject_id}/lessons", dependencies=[Depends(require_roles("admin", "teacher"))], response_model=list[LessonOut])
+@app.get(
+    "/api/subjects/{subject_id}/lessons",
+    dependencies=[Depends(require_roles("admin", "teacher"))],
+    response_model=list[LessonListItemOut],
+)
 async def subject_lessons(subject_id: int, session: AsyncSession = Depends(get_session)):
-    lessons = await subjects_repo.list_subject_lessons(session, subject_id)
+    rows = await lessons_repo.list_subject_lessons_with_group_ids(session, subject_id)
     return [
-        LessonOut(id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at)
-        for l in lessons
+        LessonListItemOut(
+            id=l.id,
+            subject_id=l.subject_id,
+            title=l.title,
+            status=l.status,
+            publish_at=l.publish_at,
+            group_ids=gids,
+        )
+        for (l, gids) in rows
     ]
 
 # Lessons

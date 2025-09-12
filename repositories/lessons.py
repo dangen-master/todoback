@@ -130,3 +130,23 @@ async def update_lesson(
 
 async def get_accessible_lessons_for_user(session: AsyncSession, *, user_id: int) -> list["Lesson"]:
     user_groups = select(GroupMember.group_id).where(GroupMember.user_id == user_id)
+
+
+async def list_subject_lessons_with_group_ids(session: AsyncSession, subject_id: int) -> list[tuple[Lesson, list[int]]]:
+    """Вернёт [(Lesson, [group_ids]), ...] по subject_id, сортировка id DESC."""
+    lessons = (await session.execute(
+        select(Lesson).where(Lesson.subject_id == subject_id).order_by(Lesson.id.desc())
+    )).scalars().all()
+    if not lessons:
+        return []
+
+    ids = [l.id for l in lessons]
+    rows = await session.execute(
+        select(LessonAccessGroup.lesson_id, LessonAccessGroup.group_id)
+        .where(LessonAccessGroup.lesson_id.in_(ids))
+    )
+    mapping: dict[int, list[int]] = {}
+    for lid, gid in rows.all():
+        mapping.setdefault(lid, []).append(gid)
+
+    return [(l, mapping.get(l.id, [])) for l in lessons]
