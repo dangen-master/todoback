@@ -155,7 +155,7 @@ class LessonOut(BaseModel):
     subject_id: int
     title: str
     status: str
-    publish_at: Optional[datetime] = None
+    publish_at: datetime | None = None
 
 class LessonDetailOut(LessonOut):
     blocks: list[LessonBlockOut]
@@ -379,11 +379,19 @@ async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSessio
 async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session)):
     user = await users_repo.get_user_by_tg(session, tg_id)
     if not user:
+        # можно оставить 404 для «неизвестного» tg_id; если хочешь — вернём []:
+        # return []
         raise HTTPException(status_code=404, detail="User not found")
     lessons = await lessons_repo.get_accessible_lessons_for_user(session, user_id=user.id)
+    # если уроков нет — вернём просто [] (никаких 500)
     return [
-        LessonOut(id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at)
-        for l in lessons
+        LessonOut(
+            id=l.id,
+            subject_id=l.subject_id,
+            title=l.title,
+            status=l.status,
+            publish_at=l.publish_at,
+        ) for l in lessons
     ]
 
 

@@ -128,8 +128,50 @@ async def update_lesson(
 
 # --- Доступность уроков -----------------------------------------------------
 
-async def get_accessible_lessons_for_user(session: AsyncSession, *, user_id: int) -> list["Lesson"]:
+async def get_accessible_lessons_for_user(session: AsyncSession, *, user_id: int) -> list[Lesson]:
+    # группы пользователя (SELECT ...)
     user_groups = select(GroupMember.group_id).where(GroupMember.user_id == user_id)
+
+    # статус + окно публикации (SQLite-safe now)
+    status_ok = Lesson.status == "published"
+    publish_ready = or_(Lesson.publish_at.is_(None), Lesson.publish_at <= func.datetime("now"))
+
+    # персональный доступ
+    exists_personal = (
+        select(literal(1))
+        .where(and_(LessonAccessUser.lesson_id == Lesson.id,
+                    LessonAccessUser.user_id == user_id))
+        .exists()
+    )
+
+    # доступ через выдачи группам
+    exists_group_grant = (
+        select(literal(1))
+        .where(and_(LessonAccessGroup.lesson_id == Lesson.id,
+                    LessonAccessGroup.group_id.in_(user_groups)))
+        .exists()
+    )
+
+    # доступ по прямой привязке урока к группе
+    lesson_group_match = Lesson.group_id.in_(user_groups)
+
+    # доступ по предмету (subject_access_groups)
+    exists_subject_grant = (
+        select(literal(1))
+        .where(and_(SubjectAccessGroup.subject_id == Lesson.subject_id,
+                    SubjectAccessGroup.group_id.in_(user_groups)))
+        .exists()
+    )
+
+    stmt = (
+        select(Lesson)
+        .where(status_ok)
+        .where(publish_ready)
+        .where(or_(exists_personal, exists_group_grant, lesson_group_match, exists_subject_grant))
+        .order_by(Lesson.id.desc())
+    )
+    res = await session.execute(stmt)
+    return res.scalars().all()
 
 
 async def list_subject_lessons_with_group_ids(session: AsyncSession, subject_id: int) -> list[tuple[Lesson, list[int]]]:
