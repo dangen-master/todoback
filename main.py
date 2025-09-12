@@ -395,45 +395,57 @@ async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSessio
 
 @app.get("/api/lessons/accessible/{tg_id}", response_model=list[LessonOut])
 async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session)):
+    # 1) находим пользователя по tg_id
     user = await users_repo.get_user_by_tg(session, tg_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # группы пользователя
-    rows = await session.execute(select(GroupMember.group_id).where(GroupMember.user_tg_id == tg_id))
-    user_gids = [r[0] for r in rows.all()]
+    # 2) берём группы по ВНУТРЕННЕМУ user_id (а не по tg_id!)
+    rows = await session.execute(
+        select(GroupMember.group_id).where(GroupMember.user_id == user.id)
+    )
+    user_gids = [gid for (gid,) in rows.all()]
+    if not user_gids:
+        # без групп студент ничего видеть не должен — безопасно выходим
+        return []
 
-    # текущее время (если publish_at TZ-aware — используй datetime.now(timezone.utc))
     now = datetime.utcnow()
 
-    # опубликован и не раньше плановой даты
-    cond_pub = (Lesson.status == "published") & (Lesson.publish_at.is_(None) | (Lesson.publish_at <= now))
+    # опубликован (и не раньше плановой даты)
+    cond_pub = (Lesson.status == "published") & (
+        Lesson.publish_at.is_(None) | (Lesson.publish_at <= now)
+    )
 
-    # у урока есть хотя бы одна группа
+    # у урока вообще есть привязки к группам
     cond_has_lesson_groups = exists().where(LessonAccessGroup.lesson_id == Lesson.id)
 
-    # пересечение урока с группами пользователя
+    # пересечение групп пользователя с группами УРОКА
     cond_by_lesson_group = exists().where(
         (LessonAccessGroup.lesson_id == Lesson.id) &
         (LessonAccessGroup.group_id.in_(user_gids))
     )
 
-    # пересечение предмета урока с группами пользователя
+    # пересечение групп пользователя с группами ПРЕДМЕТА
     cond_by_subject_group = exists().where(
         (SubjectAccessGroup.subject_id == Lesson.subject_id) &
         (SubjectAccessGroup.group_id.in_(user_gids))
     )
 
-    # ⛔️ Требуем ОДНОВРЕМЕННО: опубликован + есть группы у урока + матч урока + матч предмета
+    # Требуем ВСЁ одновременно:
+    # опубликован + у урока есть группы + матч по уроку + матч по предмету
     q = (
         select(Lesson)
         .where(cond_pub & cond_has_lesson_groups & cond_by_lesson_group & cond_by_subject_group)
         .order_by(Lesson.id.desc())
     )
-    lessons = (await session.execute(q)).scalars().all()
 
-    return [LessonOut(id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at)
-            for l in lessons]
+    lessons = (await session.execute(q)).scalars().all()
+    return [
+        LessonOut(
+            id=l.id, subject_id=l.subject_id, title=l.title,
+            status=l.status, publish_at=l.publish_at
+        ) for l in lessons
+    ]
 
 
 # -------- Roles & Groups --------
