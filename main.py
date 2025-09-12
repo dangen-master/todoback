@@ -71,11 +71,6 @@ class SubjectCreateIn(BaseModel):
     description: Optional[str] = None
     group_ids: Optional[list[int]] = None   # ← новые группы для доступа к предмету
 
-class SubjectOut(BaseModel):
-    id: int
-    name: str
-    description: Optional[str] = None
-
 class LessonBlockIn(BaseModel):
     type: str = Field(..., pattern="^(text|image)$")
     text: Optional[str] = None
@@ -134,6 +129,49 @@ class GroupMemberIn(BaseModel):
 class GroupCreateIn(BaseModel):
     name: str
 
+class SubjectOut(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    group_ids: list[int]  # ← добавили
+
+class SubjectOutFull(SubjectOut):
+    pass
+
+class SubjectPatchIn(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    group_ids: Optional[list[int]] = None
+
+class LessonBlockOut(BaseModel):
+    position: int
+    type: str
+    text: Optional[str] = None
+    image_url: Optional[str] = None
+    caption: Optional[str] = None
+
+class LessonOut(BaseModel):
+    id: int
+    subject_id: int
+    title: str
+    status: str
+    publish_at: Optional[datetime] = None
+
+class LessonDetailOut(LessonOut):
+    blocks: list[LessonBlockOut]
+    group_ids: list[int]
+
+class LessonPatchIn(BaseModel):
+    title: Optional[str] = None
+    publish: Optional[bool] = None
+    publish_at: Optional[datetime] = None
+    blocks: Optional[list[LessonBlockIn]] = None
+    group_ids: Optional[list[int]] = None
+    user_tg_ids: Optional[list[int]] = None
+
+class GroupPatchIn(BaseModel):
+    name: str
+
 # ---------- Endpoints ----------
 @app.get("/api/health")
 async def health():
@@ -185,16 +223,54 @@ async def get_user_profile(tg_id: int, session: AsyncSession = Depends(get_sessi
 # Subjects
 @app.get("/api/subjects", response_model=list[SubjectOut])
 async def list_subjects(session: AsyncSession = Depends(get_session)):
-    rows = await subjects_repo.list_subjects(session)
-    return [SubjectOut(id=s.id, name=s.name, description=s.description) for s in rows]
+    rows = await subjects_repo.list_subjects_with_group_ids(session)
+    return [
+        SubjectOut(
+            id=s.id, name=s.name, description=s.description,
+            group_ids=gids
+        ) for (s, gids) in rows
+    ]
+
+@app.get("/api/subjects/{subject_id}", response_model=SubjectOutFull)
+async def get_subject(subject_id: int, session: AsyncSession = Depends(get_session)):
+    row = await subjects_repo.get_subject_with_group_ids(session, subject_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    s, gids = row
+    return SubjectOutFull(id=s.id, name=s.name, description=s.description, group_ids=gids)
 
 @app.post("/api/subjects", response_model=SubjectOut, status_code=status.HTTP_201_CREATED)
 async def create_subject(payload: SubjectCreateIn, session: AsyncSession = Depends(get_session)):
     subj = await subjects_repo.create_subject(session, name=payload.name, description=payload.description)
     if payload.group_ids:
-        await subjects_repo.grant_subject_to_groups(session, subject_id=subj.id, group_ids=payload.group_ids)
+        await subjects_repo.set_subject_groups(session, subject_id=subj.id, group_ids=payload.group_ids)
     await session.commit()
-    return SubjectOut(id=subj.id, name=subj.name, description=subj.description)
+    row = await subjects_repo.get_subject_with_group_ids(session, subj.id)
+    s, gids = row  # row точно есть
+    return SubjectOut(id=s.id, name=s.name, description=s.description, group_ids=gids)
+
+@app.patch("/api/subjects/{subject_id}", dependencies=[Depends(require_roles("admin", "teacher"))], response_model=SubjectOutFull)
+async def patch_subject(subject_id: int, body: SubjectPatchIn, session: AsyncSession = Depends(get_session)):
+    subj = await subjects_repo.update_subject(
+        session,
+        subject_id=subject_id,
+        name=body.name,
+        description=body.description,
+        group_ids=body.group_ids,
+    )
+    if not subj:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    await session.commit()
+    s, gids = await subjects_repo.get_subject_with_group_ids(session, subject_id)
+    return SubjectOutFull(id=s.id, name=s.name, description=s.description, group_ids=gids)
+
+@app.get("/api/subjects/{subject_id}/lessons", dependencies=[Depends(require_roles("admin", "teacher"))], response_model=list[LessonOut])
+async def subject_lessons(subject_id: int, session: AsyncSession = Depends(get_session)):
+    lessons = await subjects_repo.list_subject_lessons(session, subject_id)
+    return [
+        LessonOut(id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at)
+        for l in lessons
+    ]
 
 # Lessons
 @app.post("/api/lessons", response_model=LessonOut, status_code=status.HTTP_201_CREATED)
@@ -214,18 +290,71 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
     except lessons_repo.PayloadInvalidError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # дополнительные выдачи доступа
     if payload.group_ids:
-        await lessons_repo.grant_access_to_groups(session, lesson_id=lesson.id, group_ids=payload.group_ids)
+        await lessons_repo.set_lesson_groups(session, lesson_id=lesson.id, group_ids=payload.group_ids)
     if payload.user_tg_ids:
         ids: list[int] = []
         for tg in payload.user_tg_ids:
             u = await users_repo.ensure_user(session, tg)
             ids.append(u.id)
-        await lessons_repo.grant_access_to_users(session, lesson_id=lesson.id, user_ids=ids)
+        await lessons_repo.update_lesson(session, lesson_id=lesson.id, user_ids=ids)  # добавим персональные
 
     await session.commit()
-    return LessonOut(id=lesson.id, subject_id=lesson.subject_id, title=lesson.title)
+    return LessonOut(id=lesson.id, subject_id=lesson.subject_id, title=lesson.title, status=lesson.status, publish_at=lesson.publish_at)
+
+@app.get("/api/lessons/{lesson_id}", response_model=LessonDetailOut)
+async def get_lesson_detail(lesson_id: int, session: AsyncSession = Depends(get_session)):
+    row = await lessons_repo.get_lesson_detail(session, lesson_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    l, gids = row
+    blocks = [
+        LessonBlockOut(position=b.position, type=b.type, text=b.text, image_url=b.image_url, caption=b.caption)
+        for b in l.blocks
+    ]
+    return LessonDetailOut(
+        id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at,
+        blocks=blocks, group_ids=gids
+    )
+
+@app.patch("/api/lessons/{lesson_id}", dependencies=[Depends(require_roles("admin", "teacher"))], response_model=LessonDetailOut)
+async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSession = Depends(get_session)):
+    blocks_payload = None
+    if body.blocks is not None:
+        blocks_payload = [{"type": b.type, "text": b.text, "image_url": b.image_url, "caption": b.caption} for b in body.blocks]
+
+    user_ids = None
+    if body.user_tg_ids:
+        user_ids = []
+        for tg in body.user_tg_ids:
+            u = await users_repo.ensure_user(session, tg)
+            user_ids.append(u.id)
+
+    l = await lessons_repo.update_lesson(
+        session,
+        lesson_id=lesson_id,
+        title=body.title,
+        publish=body.publish,
+        publish_at=body.publish_at,
+        blocks=blocks_payload,
+        group_ids=body.group_ids,
+        user_ids=user_ids,
+    )
+    if not l:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    await session.commit()
+
+    # вернуть обновлённые детали
+    l, gids = await lessons_repo.get_lesson_detail(session, lesson_id)
+    blocks = [
+        LessonBlockOut(position=b.position, type=b.type, text=b.text, image_url=b.image_url, caption=b.caption)
+        for b in l.blocks
+    ]
+    return LessonDetailOut(
+        id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at,
+        blocks=blocks, group_ids=gids
+    )
+
 
 @app.get("/api/lessons/accessible/{tg_id}", response_model=list[LessonOut])
 async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session)):
@@ -233,7 +362,11 @@ async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_ses
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     lessons = await lessons_repo.get_accessible_lessons_for_user(session, user_id=user.id)
-    return [LessonOut(id=l.id, subject_id=l.subject_id, title=l.title) for l in lessons]
+    return [
+        LessonOut(id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at)
+        for l in lessons
+    ]
+
 
 # Access grants (legacy helpers)
 @app.post("/api/access/grant/users")
@@ -311,3 +444,22 @@ async def create_group(body: GroupCreateIn, session: AsyncSession = Depends(get_
         raise HTTPException(status_code=409, detail="Group already exists")
     await session.commit()
     return {"id": g.id, "name": g.name}
+
+@app.patch("/api/groups/{group_id}", dependencies=[Depends(require_roles("admin", "teacher"))])
+async def patch_group(group_id: int, body: GroupPatchIn, session: AsyncSession = Depends(get_session)):
+    g = await session.get(users_repo.Group, group_id)  # модель Group доступна через users_repo
+    if not g:
+        raise HTTPException(status_code=404, detail="Group not found")
+    g.name = body.name
+    await session.flush()
+    await session.commit()
+    return {"id": g.id, "name": g.name}
+
+@app.delete("/api/groups/{group_id}", dependencies=[Depends(require_roles("admin", "teacher"))], status_code=204)
+async def delete_group(group_id: int, session: AsyncSession = Depends(get_session)):
+    g = await session.get(users_repo.Group, group_id)
+    if not g:
+        raise HTTPException(status_code=404, detail="Group not found")
+    await session.delete(g)
+    await session.commit()
+    return None

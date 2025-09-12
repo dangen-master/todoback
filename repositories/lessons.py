@@ -1,15 +1,17 @@
-from typing import Sequence
-from sqlalchemy import select, func, and_, or_, literal
+from typing import Sequence, Optional
+from sqlalchemy import select, func, and_, or_, literal, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import (
     Lesson, LessonBlock, Subject,
     LessonAccessUser, LessonAccessGroup,
-    Group, GroupMember, SubjectAccessGroup,
+    Group, GroupMember, SubjectAccessGroup, User
 )
 
 class SubjectNotFoundError(Exception): ...
 class PayloadInvalidError(Exception): ...
+
+# --- Создание ---------------------------------------------------------------
 
 async def create_lesson(
     session: AsyncSession,
@@ -53,59 +55,78 @@ async def create_lesson(
         ))
     return lesson
 
-async def grant_access_to_users(session: AsyncSession, *, lesson_id: int, user_ids: Sequence[int]) -> int:
-    if not user_ids:
-        return 0
-    for uid in user_ids:
-        session.merge(LessonAccessUser(lesson_id=lesson_id, user_id=uid))
-    return len(user_ids)
+# --- Детали/обновление ------------------------------------------------------
 
-async def grant_access_to_groups(session: AsyncSession, *, lesson_id: int, group_ids: Sequence[int]) -> int:
+async def get_lesson_detail(session: AsyncSession, lesson_id: int) -> tuple["Lesson", list[int]] | None:
+    lesson = await session.get(Lesson, lesson_id)
+    if not lesson:
+        return None
+    rows = await session.execute(
+        select(LessonAccessGroup.group_id).where(LessonAccessGroup.lesson_id == lesson_id)
+    )
+    group_ids = [gid for (gid,) in rows.all()]
+    # блоки уже подгружаются через relationship(order_by position) с lazy="selectin" в модели
+    return lesson, group_ids
+
+async def replace_lesson_blocks(session: AsyncSession, *, lesson_id: int, blocks: Sequence[dict]) -> int:
+    await session.execute(delete(LessonBlock).where(LessonBlock.lesson_id == lesson_id))
+    n = 0
+    for i, b in enumerate(blocks, start=1):
+        session.add(LessonBlock(
+            lesson_id=lesson_id,
+            type=b["type"],
+            position=i,
+            text=b.get("text"),
+            image_url=b.get("image_url"),
+            caption=b.get("caption"),
+        ))
+        n += 1
+    return n
+
+async def set_lesson_groups(session: AsyncSession, *, lesson_id: int, group_ids: Sequence[int]) -> int:
+    await session.execute(delete(LessonAccessGroup).where(LessonAccessGroup.lesson_id == lesson_id))
     if not group_ids:
         return 0
-    res = await session.execute(select(Group.id).where(Group.id.in_(group_ids)))
-    valid_ids = [gid for (gid,) in res.all()]
-    for gid in valid_ids:
+    valid = await session.execute(select(Group.id).where(Group.id.in_(group_ids)))
+    ids = [gid for (gid,) in valid.all()]
+    for gid in ids:
         session.merge(LessonAccessGroup(lesson_id=lesson_id, group_id=gid))
-    return len(valid_ids)
+    return len(ids)
+
+async def update_lesson(
+    session: AsyncSession,
+    *,
+    lesson_id: int,
+    title: Optional[str] = None,
+    publish: Optional[bool] = None,
+    publish_at = None,   # datetime | None
+    blocks: Optional[Sequence[dict]] = None,
+    group_ids: Optional[Sequence[int]] = None,
+    user_ids: Optional[Sequence[int]] = None,
+) -> "Lesson | None":
+    lesson = await session.get(Lesson, lesson_id)
+    if not lesson:
+        return None
+    changed = False
+    if title is not None and lesson.title != title:
+        lesson.title = title; changed = True
+    if publish is not None:
+        lesson.status = "published" if publish else "draft"; changed = True
+    if publish_at is not None:
+        lesson.publish_at = publish_at; changed = True
+    if blocks is not None:
+        # простая стратегия: полный replace
+        await replace_lesson_blocks(session, lesson_id=lesson_id, blocks=blocks)
+    if group_ids is not None:
+        await set_lesson_groups(session, lesson_id=lesson_id, group_ids=group_ids)
+    if user_ids:
+        for uid in user_ids:
+            session.merge(LessonAccessUser(lesson_id=lesson_id, user_id=uid))
+    if changed:
+        await session.flush()
+    return lesson
+
+# --- Доступность уроков -----------------------------------------------------
 
 async def get_accessible_lessons_for_user(session: AsyncSession, *, user_id: int) -> list["Lesson"]:
-    # группы пользователя
     user_groups = select(GroupMember.group_id).where(GroupMember.user_id == user_id)
-
-    # доступ через персональные выдачи
-    user_access_exists = select(literal(1)).where(
-        and_(LessonAccessUser.lesson_id == Lesson.id, LessonAccessUser.user_id == user_id)
-    ).exists()
-
-    # доступ через выдачи группам
-    group_access_exists = select(literal(1)).where(
-        and_(LessonAccessGroup.lesson_id == Lesson.id, LessonAccessGroup.group_id.in_(user_groups))
-    ).exists()
-
-    # доступ по прямой привязке урока к группе
-    lesson_group_match = select(literal(1)).where(
-        and_(Lesson.group_id.is_not(None), Lesson.group_id.in_(user_groups))
-    ).exists()
-
-    # доступ по привязке ПРЕДМЕТА к группам
-    subject_group_access = select(literal(1)).where(
-        and_(SubjectAccessGroup.subject_id == Lesson.subject_id,
-             SubjectAccessGroup.group_id.in_(user_groups))
-    ).exists()
-
-    # публикация: либо publish_at IS NULL, либо уже наступила
-    publish_ready = or_(Lesson.publish_at.is_(None), Lesson.publish_at <= func.datetime("now"))
-
-    stmt = (
-        select(Lesson)
-        .where(Lesson.status == "published")
-        .where(publish_ready)
-        .where(or_(user_access_exists, group_access_exists, lesson_group_match, subject_group_access))
-        .order_by(Lesson.id.desc())
-    )
-    res = await session.execute(stmt)
-    return res.scalars().all()
-
-async def get_lesson_with_blocks(session: AsyncSession, lesson_id: int) -> "Lesson | None":
-    return await session.get(Lesson, lesson_id)
