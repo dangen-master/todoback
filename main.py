@@ -12,6 +12,12 @@ from models import async_session, init_db, Group  # ← берем Group из mo
 from repositories import users as users_repo
 from repositories import subjects as subjects_repo
 from repositories import lessons as lessons_repo
+from sqlalchemy import select, func, and_, or_, literal, exists
+from models import (
+    Lesson, LessonAccessUser, LessonAccessGroup,
+    SubjectAccessGroup, GroupMember
+)
+
 
 # ---------- DB session ----------
 async def get_session() -> AsyncIterator[AsyncSession]:
@@ -392,11 +398,43 @@ async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_ses
     user = await users_repo.get_user_by_tg(session, tg_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    lessons = await lessons_repo.get_accessible_lessons_for_user(session, user_id=user.id)
-    return [
-        LessonOut(id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at)
-        for l in lessons
-    ]
+
+    # группы пользователя
+    rows = await session.execute(select(GroupMember.group_id).where(GroupMember.user_tg_id == tg_id))
+    user_gids = [r[0] for r in rows.all()]
+
+    # текущее время (если publish_at TZ-aware — используй datetime.now(timezone.utc))
+    now = datetime.utcnow()
+
+    # опубликован и не раньше плановой даты
+    cond_pub = (Lesson.status == "published") & (Lesson.publish_at.is_(None) | (Lesson.publish_at <= now))
+
+    # у урока есть хотя бы одна группа
+    cond_has_lesson_groups = exists().where(LessonAccessGroup.lesson_id == Lesson.id)
+
+    # пересечение урока с группами пользователя
+    cond_by_lesson_group = exists().where(
+        (LessonAccessGroup.lesson_id == Lesson.id) &
+        (LessonAccessGroup.group_id.in_(user_gids))
+    )
+
+    # пересечение предмета урока с группами пользователя
+    cond_by_subject_group = exists().where(
+        (SubjectAccessGroup.subject_id == Lesson.subject_id) &
+        (SubjectAccessGroup.group_id.in_(user_gids))
+    )
+
+    # ⛔️ Требуем ОДНОВРЕМЕННО: опубликован + есть группы у урока + матч урока + матч предмета
+    q = (
+        select(Lesson)
+        .where(cond_pub & cond_has_lesson_groups & cond_by_lesson_group & cond_by_subject_group)
+        .order_by(Lesson.id.desc())
+    )
+    lessons = (await session.execute(q)).scalars().all()
+
+    return [LessonOut(id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at)
+            for l in lessons]
+
 
 # -------- Roles & Groups --------
 @app.get("/api/roles", dependencies=[Depends(require_roles("admin", "teacher"))])
