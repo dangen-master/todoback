@@ -1,5 +1,5 @@
 from typing import Sequence, Optional
-from sqlalchemy import select, func, and_, or_, literal, delete
+from sqlalchemy import select, func, and_, or_, literal, delete, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import (
@@ -83,15 +83,17 @@ async def replace_lesson_blocks(session: AsyncSession, *, lesson_id: int, blocks
         n += 1
     return n
 
-async def set_lesson_groups(session: AsyncSession, *, lesson_id: int, group_ids: Sequence[int]) -> int:
+async def set_lesson_groups(session, lesson_id: int, group_ids: list[int]) -> None:
+    ids = {int(g) for g in (group_ids or [])}
+    if ids:
+        rows = await session.execute(select(Group.id).where(Group.id.in_(ids)))
+        ids = {r[0] for r in rows.all()}
     await session.execute(delete(LessonAccessGroup).where(LessonAccessGroup.lesson_id == lesson_id))
-    if not group_ids:
-        return 0
-    valid = await session.execute(select(Group.id).where(Group.id.in_(group_ids)))
-    ids = [gid for (gid,) in valid.all()]
-    for gid in ids:
-        session.merge(LessonAccessGroup(lesson_id=lesson_id, group_id=gid))
-    return len(ids)
+    if ids:
+        await session.execute(
+            insert(LessonAccessGroup),
+            [{"lesson_id": lesson_id, "group_id": gid} for gid in ids]
+        )
 
 async def update_lesson(
     session: AsyncSession,

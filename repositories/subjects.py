@@ -1,5 +1,5 @@
 from typing import List, Sequence, Optional
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from models import Subject, SubjectAccessGroup, Group, Lesson
 
@@ -36,18 +36,18 @@ async def get_subject_with_group_ids(session: AsyncSession, subject_id: int) -> 
     )
     return subj, [gid for (gid,) in gids.all()]
 
-async def set_subject_groups(session: AsyncSession, *, subject_id: int, group_ids: Sequence[int]) -> int:
-    """Полная замена связей предмет↔группы (idempotent). Неизвестные group_id игнорируются."""
-    # удалить старые
+async def set_subject_groups(session, subject_id: int, group_ids: list[int]) -> None:
+    ids = {int(g) for g in (group_ids or [])}
+    if ids:
+        rows = await session.execute(select(Group.id).where(Group.id.in_(ids)))
+        ids = {r[0] for r in rows.all()}  # только существующие группы
+
     await session.execute(delete(SubjectAccessGroup).where(SubjectAccessGroup.subject_id == subject_id))
-    if not group_ids:
-        return 0
-    # оставить только существующие группы
-    valid = await session.execute(select(Group.id).where(Group.id.in_(group_ids)))
-    ids = [gid for (gid,) in valid.all()]
-    for gid in ids:
-        session.merge(SubjectAccessGroup(subject_id=subject_id, group_id=gid))
-    return len(ids)
+    if ids:
+        await session.execute(
+            insert(SubjectAccessGroup),
+            [{"subject_id": subject_id, "group_id": gid} for gid in ids]
+        )
 
 async def update_subject(
     session: AsyncSession,
@@ -71,6 +71,12 @@ async def update_subject(
         await session.flush()
     return subj
 
+async def get_subject_group_ids(session, subject_id: int) -> list[int]:
+    rows = await session.execute(
+        select(SubjectAccessGroup.group_id).where(SubjectAccessGroup.subject_id == subject_id)
+    )
+    return [r[0] for r in rows.all()]
+
 # --- Выборки уроков по предмету --------------------------------------------
 
 async def list_subject_lessons(session: AsyncSession, subject_id: int) -> list[Lesson]:
@@ -78,3 +84,4 @@ async def list_subject_lessons(session: AsyncSession, subject_id: int) -> list[L
         select(Lesson).where(Lesson.subject_id == subject_id).order_by(Lesson.id.desc())
     )
     return rows.scalars().all()
+
