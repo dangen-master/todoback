@@ -5,7 +5,7 @@ from datetime import datetime
 
 from fastapi import FastAPI, Depends, HTTPException, status, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator, FieldValidationInfo
+from pydantic import BaseModel, Field, field_validator, FieldValidationInfo, AliasChoices, ConfigDict, FieldValidationInfo
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import async_session, init_db
@@ -67,9 +67,13 @@ class EnsureUserIn(BaseModel):
     avatar_url: Optional[str] = None
 
 class SubjectCreateIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     name: str
     description: Optional[str] = None
-    group_ids: Optional[list[int]] = None   # ← новые группы для доступа к предмету
+    # примем и group_ids, и groupIds
+    group_ids: Optional[list[int]] = Field(
+        default=None, validation_alias=AliasChoices("group_ids", "groupIds")
+    )
 
 class LessonBlockIn(BaseModel):
     type: str = Field(..., pattern="^(text|image)$")
@@ -90,13 +94,20 @@ class LessonBlockIn(BaseModel):
         return v
 
 class LessonCreateIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     subject_id: int
     title: str
     publish: bool = True
-    publish_at: Optional[datetime] = None     # ← плановая публикация
+    publish_at: Optional[datetime] = Field(
+        default=None, validation_alias=AliasChoices("publish_at", "publishAt")
+    )
     blocks: list[LessonBlockIn]
-    group_ids: Optional[list[int]] = None     # доп. выдача доступа группам
-    user_tg_ids: Optional[list[int]] = None   # доп. выдача доступа юзерам
+    group_ids: Optional[list[int]] = Field(
+        default=None, validation_alias=AliasChoices("group_ids", "groupIds")
+    )
+    user_tg_ids: Optional[list[int]] = Field(
+        default=None, validation_alias=AliasChoices("user_tg_ids", "userTgIds")
+    )
 
 class LessonOut(BaseModel):
     id: int
@@ -139,9 +150,12 @@ class SubjectOutFull(SubjectOut):
     pass
 
 class SubjectPatchIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     name: Optional[str] = None
     description: Optional[str] = None
-    group_ids: Optional[list[int]] = None
+    group_ids: Optional[list[int]] = Field(
+        default=None, validation_alias=AliasChoices("group_ids", "groupIds")
+    )
 
 class LessonBlockOut(BaseModel):
     position: int
@@ -162,12 +176,19 @@ class LessonDetailOut(LessonOut):
     group_ids: list[int]
 
 class LessonPatchIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     title: Optional[str] = None
     publish: Optional[bool] = None
-    publish_at: Optional[datetime] = None
+    publish_at: Optional[datetime] = Field(
+        default=None, validation_alias=AliasChoices("publish_at", "publishAt")
+    )
     blocks: Optional[list[LessonBlockIn]] = None
-    group_ids: Optional[list[int]] = None
-    user_tg_ids: Optional[list[int]] = None
+    group_ids: Optional[list[int]] = Field(
+        default=None, validation_alias=AliasChoices("group_ids", "groupIds")
+    )
+    user_tg_ids: Optional[list[int]] = Field(
+        default=None, validation_alias=AliasChoices("user_tg_ids", "userTgIds")
+    )
 
 class GroupPatchIn(BaseModel):
     name: str
