@@ -209,32 +209,104 @@ class Bookmark(Base):
 
 # ---------- Schema init / seed ----------
 async def seed_initial_data(session: AsyncSession) -> None:
-    # roles
+    # 1) роли (понадобятся для админки, пользователей НЕ создаём)
     for code, name in [("student", "Student"), ("teacher", "Teacher"), ("admin", "Admin")]:
         if not await session.scalar(select(Role).where(Role.code == code)):
             session.add(Role(code=code, name=name))
     await session.flush()
 
-    # groups
-    g1 = await session.scalar(select(Group).where(Group.name == "Группа 11-ИС")) or Group(name="Группа 11-ИС")
-    g2 = await session.scalar(select(Group).where(Group.name == "Frontend-курс")) or Group(name="Frontend-курс")
-    session.add_all([g1, g2]); await session.flush()
+    # 2) группы
+    group_names = ["Группа 11-ИС", "Frontend-курс", "Бэкенд-курс"]
+    groups: dict[str, Group] = {}
+    for n in group_names:
+        g = await session.scalar(select(Group).where(Group.name == n))
+        if not g:
+            g = Group(name=n)
+            session.add(g)
+            await session.flush()
+        groups[n] = g
 
-    # subject (by name; no code/creator)
-    subj = await session.scalar(select(Subject).where(Subject.name == "Алгебра"))
-    if not subj:
-        subj = Subject(name="Алгебра", description="Базовый курс алгебры")
-        session.add(subj); await session.flush()
-        # subject-level access for g1
-        session.add(SubjectAccessGroup(subject_id=subj.id, group_id=g1.id))
+    # 3) предметы + доступ по предметам
+    subjects_data = [
+        {"name": "Алгебра",      "description": "Базовый курс алгебры",               "group_names": ["Группа 11-ИС"]},
+        {"name": "Геометрия",    "description": "Фигуры, теоремы и доказательства",    "group_names": ["Группа 11-ИС"]},
+        {"name": "Физика",       "description": "Механика, оптика, электричество",     "group_names": ["Frontend-курс"]},
+        {"name": "Информатика",  "description": "Алгоритмы и структуры данных",        "group_names": ["Frontend-курс", "Бэкенд-курс"]},
+        {"name": "История",      "description": "Мировая история XX века",             "group_names": []},  # доступ раздаём на уровне уроков
+    ]
 
-        # example lesson: published now, linked to g1
-        lesson = Lesson(subject_id=subj.id, title="Урок 1. Множества", status="published", publish_at=func.datetime("now"), group_id=g1.id)
-        session.add(lesson); await session.flush()
-        session.add_all([
-            LessonBlock(lesson_id=lesson.id, type="text", position=1, text="Что такое множество? Базовые определения."),
-            LessonBlock(lesson_id=lesson.id, type="image", position=2, image_url="https://placehold.co/600x400", caption="Диаграмма Венна"),
-        ])
+    subjects: dict[str, Subject] = {}
+    for s in subjects_data:
+        subj = await session.scalar(select(Subject).where(Subject.name == s["name"]))
+        if not subj:
+            subj = Subject(name=s["name"], description=s["description"])
+            session.add(subj)
+            await session.flush()
+        # subject_access_groups (upsert через merge)
+        for gn in s["group_names"]:
+            session.merge(SubjectAccessGroup(subject_id=subj.id, group_id=groups[gn].id))
+        subjects[s["name"]] = subj
+
+    await session.flush()
+
+    # 4) уроки по предметам
+    lessons_data = {
+        "Алгебра": [
+            {"title": "Урок 1. Множества",                 "status": "published", "publish_at": func.datetime("now"),             "grant_groups": []},
+            {"title": "Урок 2. Операции над множествами",  "status": "published", "publish_at": func.datetime("now", "+1 day"),   "grant_groups": []},
+            {"title": "Урок 3. Последовательности",        "status": "draft",     "publish_at": None,                             "grant_groups": []},
+        ],
+        "Геометрия": [
+            {"title": "Треугольники и их свойства",        "status": "published", "publish_at": func.datetime("now"),             "grant_groups": []},
+            {"title": "Параллельные прямые",               "status": "published", "publish_at": func.datetime("now", "+2 days"),  "grant_groups": []},
+            {"title": "Площадь фигур",                     "status": "draft",     "publish_at": None,                             "grant_groups": []},
+        ],
+        "Физика": [
+            {"title": "Кинематика: равномерное движение",  "status": "published", "publish_at": func.datetime("now"),             "grant_groups": []},
+            {"title": "Динамика: законы Ньютона",          "status": "published", "publish_at": func.datetime("now", "+1 day"),   "grant_groups": []},
+            {"title": "Импульс и энергия",                 "status": "draft",     "publish_at": None,                             "grant_groups": []},
+        ],
+        "Информатика": [
+            {"title": "Сложность алгоритмов (Big-O)",      "status": "published", "publish_at": func.datetime("now"),             "grant_groups": ["Бэкенд-курс"]},
+            {"title": "Сортировки: быстрая и слиянием",    "status": "published", "publish_at": func.datetime("now"),             "grant_groups": []},
+            {"title": "Структуры данных: дерево/граф",     "status": "published", "publish_at": func.datetime("now", "+3 days"),  "grant_groups": []},
+        ],
+        "История": [
+            {"title": "Первая мировая война",              "status": "published", "publish_at": func.datetime("now"),             "grant_groups": ["Группа 11-ИС"]},
+            {"title": "Вторая мировая война",              "status": "published", "publish_at": func.datetime("now"),             "grant_groups": ["Frontend-курс"]},
+            {"title": "Холодная война",                    "status": "published", "publish_at": func.datetime("now", "+1 day"),   "grant_groups": ["Группа 11-ИС", "Frontend-курс"]},
+        ],
+    }
+
+    for subj_name, lessons in lessons_data.items():
+        subj = subjects[subj_name]
+        for item in lessons:
+            # проверка на существование урока по (subject_id, title)
+            exists_id = await session.scalar(
+                select(Lesson.id).where(Lesson.subject_id == subj.id, Lesson.title == item["title"])
+            )
+            if exists_id:
+                continue
+
+            lesson = Lesson(
+                subject_id=subj.id,
+                title=item["title"],
+                status=item["status"],
+                publish_at=item["publish_at"],
+                # можно также задавать lesson.group_id, но здесь используем выдачу через access-группы
+            )
+            session.add(lesson)
+            await session.flush()
+
+            # базовые блоки контента
+            session.add_all([
+                LessonBlock(lesson_id=lesson.id, type="text",  position=1, text=f"{item['title']}: вводная часть."),
+                LessonBlock(lesson_id=lesson.id, type="image", position=2, image_url="https://placehold.co/800x400", caption="Иллюстрация к теме"),
+            ])
+
+            # точечные выдачи доступа к уроку (поверх доступа по предмету)
+            for gn in item.get("grant_groups", []):
+                session.merge(LessonAccessGroup(lesson_id=lesson.id, group_id=groups[gn].id))
 
 async def init_db():
     async with engine.begin() as conn:
