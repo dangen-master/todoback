@@ -1,11 +1,11 @@
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from typing import Optional, Callable, Awaitable, Any
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Depends, HTTPException, status, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator, FieldValidationInfo, AliasChoices, ConfigDict
+from pydantic import BaseModel, Field, field_validator, ValidationInfo, AliasChoices, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import async_session, init_db, Group  # ← берем Group из models
@@ -88,13 +88,13 @@ class LessonBlockIn(BaseModel):
     caption: Optional[str] = None
 
     @field_validator("text")
-    def validate_text_for_type(cls, v, info: FieldValidationInfo):
+    def validate_text_for_type(cls, v, info: ValidationInfo):
         if (info.data or {}).get("type") == "text" and not v:
             raise ValueError("text is required when type='text'")
         return v
 
     @field_validator("image_url")
-    def validate_image_for_type(cls, v, info: FieldValidationInfo):
+    def validate_image_for_type(cls, v, info: ValidationInfo):
         if (info.data or {}).get("type") == "image" and not v:
             raise ValueError("image_url is required when type='image'")
         return v
@@ -409,7 +409,7 @@ async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_ses
         # без групп студент ничего видеть не должен — безопасно выходим
         return []
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     # опубликован (и не раньше плановой даты)
     cond_pub = (Lesson.status == "published") & (
