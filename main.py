@@ -21,6 +21,9 @@ from models import (
     SubjectAccessGroup, GroupMember
 )
 
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/files", StaticFiles(directory="uploads"), name="files")
 
 # ---------- DB session ----------
 async def get_session() -> AsyncIterator[AsyncSession]:
@@ -66,7 +69,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/files", StaticFiles(directory="uploads"), name="files")
 
 # ---------- Schemas ----------
 class EnsureUserIn(BaseModel):
