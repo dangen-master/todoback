@@ -17,28 +17,26 @@ async def _get_or_create_role(session: AsyncSession, code: str, name: Optional[s
     return role
 
 async def _ensure_student_role(session, user: User) -> None:
-    # 1) найдём/создадим саму роль
+    # 1) найти/создать роль "student"
     role = await session.scalar(select(Role).where(Role.code == "student"))
     if role is None:
         role = Role(code="student", name="Студент")
         session.add(role)
-        # flush гарантирует role.id
-        await session.flush()
+        await session.flush()  # нужен role.id
 
-    # 2) проверим членство БЕЗ обращения к user.roles (без lazy-load)
-    #    через явный запрос с join по связи User.roles
+    # 2) проверка членства БЕЗ user.roles (никакого lazy-load)
     is_member = await session.scalar(
         select(Role.id)
-        .join(User.roles)
+        .join(User.roles)                 # связь User.roles
         .where(User.id == user.id, Role.id == role.id)
         .limit(1)
     )
 
-    # 3) если ещё не состоит — добавим и зафлашим
+    # 3) если ещё не состоит — добавляем
     if is_member is None:
-        # это безопасно: без ленивой загрузки; append сработает
         user.roles.append(role)
         await session.flush()
+
 
 # --- public api ------------------------------------------------------------
 async def ensure_user(session: AsyncSession, tg_id: int, *, username: Optional[str] = None,
@@ -81,7 +79,7 @@ async def list_users(session: AsyncSession) -> list[User]:
     return result.scalars().all()
 
 class GroupAlreadyExistsError(Exception): ...
-async def get_user_profile(session, tg_id: int) -> User | None:
+async def get_user_profile(session, tg_id: int):
     return await session.scalar(
         select(User)
         .options(selectinload(User.roles), selectinload(User.groups))
