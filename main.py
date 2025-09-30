@@ -1,29 +1,23 @@
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from typing import Optional, Callable, Awaitable, Any, Literal, List
-from datetime import datetime, timezone
+from datetime import datetime
 from uuid import uuid4
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, status, Header, UploadFile, File
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator, ValidationInfo, AliasChoices, ConfigDict, model_validator
+from pydantic import BaseModel, Field, field_validator,  AliasChoices, ConfigDict, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import async_session, init_db, Group  # ← берем Group из models
 from repositories import users as users_repo
 from repositories import subjects as subjects_repo
 from repositories import lessons as lessons_repo
-from sqlalchemy import select, func, and_, or_, literal, exists
-from models import (
-    Lesson, LessonAccessUser, LessonAccessGroup,
-    SubjectAccessGroup, GroupMember
-)
-app = FastAPI()
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/files", StaticFiles(directory=str(UPLOAD_DIR)), name="files")
+from models import Lesson
+
+
 # ---------- DB session ----------
 async def get_session() -> AsyncIterator[AsyncSession]:
     async with async_session() as session:
@@ -63,12 +57,21 @@ async def lifespan(app_: FastAPI):
 app = FastAPI(title="Edu MiniApp API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://telegrammapp-44890.web.app"],
-    allow_credentials=False,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://web.telegram.org",
+        "https://telegram.org",
+        "https://*.telegram.org",
+    ],
+    allow_origin_regex=r"^https:\/\/.*\.telegram\.org$",
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/files", StaticFiles(directory=str(UPLOAD_DIR)), name="files")
 # ---------- Schemas ----------
 class EnsureUserIn(BaseModel):
     tg_id: int
@@ -363,6 +366,7 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
     if payload.pdf_url:
         db_lesson = await session.get(Lesson, lesson.id)
         db_lesson.pdf_url = payload.pdf_url
+        lesson.pdf_url = payload.pdf_url
 
     if payload.group_ids is not None:
         await lessons_repo.set_lesson_groups(session, lesson_id=lesson.id, group_ids=payload.group_ids)
@@ -378,7 +382,7 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
     # NEW: вернём pdf_url тоже
     return LessonOut(
         id=lesson.id, subject_id=lesson.subject_id, title=lesson.title,
-        status=lesson.status, publish_at=lesson.publish_at, pdf_url=getattr(lesson, "pdf_url", None)
+        status=lesson.status, publish_at=lesson.publish_at, pdf_url=lesson.pdf_url
     )
 
 
@@ -427,56 +431,17 @@ async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSessio
 
 @app.get("/api/lessons/accessible/{tg_id}", response_model=list[LessonOut])
 async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session)):
-    # 1) находим пользователя по tg_id
     user = await users_repo.get_user_by_tg(session, tg_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # 2) берём группы по ВНУТРЕННЕМУ user_id (а не по tg_id!)
-    rows = await session.execute(
-        select(GroupMember.group_id).where(GroupMember.user_id == user.id)
-    )
-    user_gids = [gid for (gid,) in rows.all()]
-    if not user_gids:
-        # без групп студент ничего видеть не должен — безопасно выходим
-        return []
-
-    now = datetime.now(timezone.utc)
-
-    # опубликован (и не раньше плановой даты)
-    cond_pub = (Lesson.status == "published") & (
-        Lesson.publish_at.is_(None) | (Lesson.publish_at <= now)
-    )
-
-    # у урока вообще есть привязки к группам
-    cond_has_lesson_groups = exists().where(LessonAccessGroup.lesson_id == Lesson.id)
-
-    # пересечение групп пользователя с группами УРОКА
-    cond_by_lesson_group = exists().where(
-        (LessonAccessGroup.lesson_id == Lesson.id) &
-        (LessonAccessGroup.group_id.in_(user_gids))
-    )
-
-    # пересечение групп пользователя с группами ПРЕДМЕТА
-    cond_by_subject_group = exists().where(
-        (SubjectAccessGroup.subject_id == Lesson.subject_id) &
-        (SubjectAccessGroup.group_id.in_(user_gids))
-    )
-
-    # Требуем ВСЁ одновременно:
-    # опубликован + у урока есть группы + матч по уроку + матч по предмету
-    q = (
-        select(Lesson)
-        .where(cond_pub & cond_has_lesson_groups & cond_by_lesson_group & cond_by_subject_group)
-        .order_by(Lesson.id.desc())
-    )
-
-    lessons = (await session.execute(q)).scalars().all()
+    lessons = await lessons_repo.get_accessible_lessons_for_user(session, user_id=user.id)
     return [
         LessonOut(
             id=l.id, subject_id=l.subject_id, title=l.title,
-            status=l.status, publish_at=l.publish_at
-        ) for l in lessons
+            status=l.status, publish_at=l.publish_at, pdf_url=l.pdf_url
+        )
+        for l in lessons
     ]
 
 
