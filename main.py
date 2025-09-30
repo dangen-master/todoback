@@ -20,11 +20,10 @@ from models import (
     Lesson, LessonAccessUser, LessonAccessGroup,
     SubjectAccessGroup, GroupMember
 )
-
+app = FastAPI()
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/files", StaticFiles(directory="uploads"), name="files")
-
+app.mount("/files", StaticFiles(directory=str(UPLOAD_DIR)), name="files")
 # ---------- DB session ----------
 async def get_session() -> AsyncIterator[AsyncSession]:
     async with async_session() as session:
