@@ -1,11 +1,14 @@
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
-from typing import Optional, Callable, Awaitable, Any
+from typing import Optional, Callable, Awaitable, Any, Literal, List
 from datetime import datetime, timezone
+from uuid import uuid4
+from pathlib import Path
 
-from fastapi import FastAPI, Depends, HTTPException, status, Header
+from fastapi import FastAPI, Depends, HTTPException, status, Header, UploadFile, File
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator, ValidationInfo, AliasChoices, ConfigDict
+from pydantic import BaseModel, Field, field_validator, ValidationInfo, AliasChoices, ConfigDict, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models import async_session, init_db, Group  # ← берем Group из models
@@ -63,6 +66,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.mount("/files", StaticFiles(directory="uploads"), name="files")
 
 # ---------- Schemas ----------
 class EnsureUserIn(BaseModel):
@@ -82,38 +86,63 @@ class SubjectCreateIn(BaseModel):
     )
 
 class LessonBlockIn(BaseModel):
-    type: str = Field(..., pattern="^(text|image)$")
+    type: Literal['text', 'image']
+    position: Optional[int] = None
     text: Optional[str] = None
     image_url: Optional[str] = None
     caption: Optional[str] = None
 
-    @field_validator("text")
-    def validate_text_for_type(cls, v, info: ValidationInfo):
-        if (info.data or {}).get("type") == "text" and not v:
+    # Жёсткая проверка для НЕпустых блоков остаётся
+    @model_validator(mode='after')
+    def _require_payload_for_type(self):
+        if self.type == 'text' and not (self.text and self.text.strip()):
             raise ValueError("text is required when type='text'")
-        return v
-
-    @field_validator("image_url")
-    def validate_image_for_type(cls, v, info: ValidationInfo):
-        if (info.data or {}).get("type") == "image" and not v:
+        if self.type == 'image' and not (self.image_url):
             raise ValueError("image_url is required when type='image'")
-        return v
+        return self
 
 class LessonCreateIn(BaseModel):
-    model_config = ConfigDict(extra="ignore")
     subject_id: int
     title: str
-    publish: bool = True
-    publish_at: Optional[datetime] = Field(
-        default=None, validation_alias=AliasChoices("publish_at", "publishAt")
-    )
-    blocks: list[LessonBlockIn]
-    group_ids: Optional[list[int]] = Field(
-        default=None, validation_alias=AliasChoices("group_ids", "groupIds")
-    )
-    user_tg_ids: Optional[list[int]] = Field(
-        default=None, validation_alias=AliasChoices("user_tg_ids", "userTgIds")
-    )
+    publish: bool = False
+
+    # NEW: либо блоки, либо pdf_url
+    pdf_url: Optional[str] = None
+
+    # было: blocks: List[dict] = Field(default_factory=list)
+    blocks: List[dict] = Field(default_factory=list)
+
+    # NEW: чтобы не падать при обращении к этим полям в create_lesson
+    publish_at: Optional[datetime] = Field(default=None, validation_alias=AliasChoices("publish_at", "publishAt"))
+    group_ids: Optional[list[int]] = Field(default=None, validation_alias=AliasChoices("group_ids", "groupIds"))
+    user_tg_ids: Optional[list[int]] = Field(default=None, validation_alias=AliasChoices("user_tg_ids", "userTgIds"))
+
+    @field_validator("blocks", mode="before")
+    @classmethod
+    def _drop_empty_blocks(cls, v):
+        items = v or []
+        cleaned = []
+        for b in items:
+            t = (b or {}).get("type")
+            if t == "text":
+                txt = (b or {}).get("text") or ""
+                if txt.strip():
+                    cleaned.append(b)
+            elif t == "image":
+                url = (b or {}).get("image_url")
+                if url:
+                    cleaned.append(b)
+        return cleaned
+
+    @model_validator(mode="after")
+    def _cast_blocks(self):
+        # если пришёл pdf_url — блоки очищаем (в таком режиме контентом служит PDF)
+        if self.pdf_url:
+            self.blocks = []
+            return self
+        self.blocks = [LessonBlockIn(**b) for b in self.blocks]
+        return self
+
 
 class GrantUsersIn(BaseModel):
     lesson_id: int
@@ -174,6 +203,7 @@ class LessonOut(BaseModel):
     title: str
     status: str
     publish_at: datetime | None = None
+    pdf_url: Optional[str] = None
 
 class LessonDetailOut(LessonOut):
     blocks: list[LessonBlockOut]
@@ -193,6 +223,7 @@ class LessonPatchIn(BaseModel):
     user_tg_ids: Optional[list[int]] = Field(
         default=None, validation_alias=AliasChoices("user_tg_ids", "userTgIds")
     )
+    pdf_url: Optional[str] = None
 
 class LessonListItemOut(BaseModel):
     id: int
@@ -311,13 +342,14 @@ async def subject_lessons(subject_id: int, session: AsyncSession = Depends(get_s
 # -------- Lessons --------
 @app.post("/api/lessons", response_model=LessonOut, status_code=status.HTTP_201_CREATED)
 async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends(get_session)):
-    blocks = [{"type": b.type, "text": b.text, "image_url": b.image_url, "caption": b.caption} for b in payload.blocks]
+    blocks = [{"type": b.type, "text": b.text, "image_url": b.image_url, "caption": b.caption} for b in getattr(payload, "blocks", [])]
+
     try:
         lesson = await lessons_repo.create_lesson(
             session,
             subject_id=payload.subject_id,
             title=payload.title,
-            blocks=blocks,
+            blocks=blocks,              # если pdf_url — список уже пуст
             publish=payload.publish,
             publish_at=payload.publish_at,
         )
@@ -325,6 +357,11 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
         raise HTTPException(status_code=404, detail=str(e))
     except lessons_repo.PayloadInvalidError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # NEW: если это «pdf-урок» — проставим ссылку
+    if payload.pdf_url:
+        db_lesson = await session.get(Lesson, lesson.id)
+        db_lesson.pdf_url = payload.pdf_url
 
     if payload.group_ids is not None:
         await lessons_repo.set_lesson_groups(session, lesson_id=lesson.id, group_ids=payload.group_ids)
@@ -336,23 +373,13 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
         await lessons_repo.update_lesson(session, lesson_id=lesson.id, user_ids=ids)
 
     await session.commit()
-    return LessonOut(id=lesson.id, subject_id=lesson.subject_id, title=lesson.title,
-                     status=lesson.status, publish_at=lesson.publish_at)
 
-@app.get("/api/lessons/{lesson_id}", response_model=LessonDetailOut)
-async def get_lesson_detail(lesson_id: int, session: AsyncSession = Depends(get_session)):
-    row = await lessons_repo.get_lesson_detail(session, lesson_id)
-    if not row:
-        raise HTTPException(status_code=404, detail="Lesson not found")
-    l, gids = row
-    blocks = [
-        LessonBlockOut(position=b.position, type=b.type, text=b.text, image_url=b.image_url, caption=b.caption)
-        for b in l.blocks
-    ]
-    return LessonDetailOut(
-        id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at,
-        blocks=blocks, group_ids=gids
+    # NEW: вернём pdf_url тоже
+    return LessonOut(
+        id=lesson.id, subject_id=lesson.subject_id, title=lesson.title,
+        status=lesson.status, publish_at=lesson.publish_at, pdf_url=getattr(lesson, "pdf_url", None)
     )
+
 
 @app.patch("/api/lessons/{lesson_id}",
            dependencies=[Depends(require_roles("admin", "teacher"))],
@@ -381,6 +408,10 @@ async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSessio
     )
     if not l:
         raise HTTPException(status_code=404, detail="Lesson not found")
+    if body.pdf_url is not None:
+        db_lesson = await session.get(Lesson, lesson_id)
+        db_lesson.pdf_url = body.pdf_url
+    
     await session.commit()
 
     l, gids = await lessons_repo.get_lesson_detail(session, lesson_id)
@@ -390,7 +421,7 @@ async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSessio
     ]
     return LessonDetailOut(
         id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at,
-        blocks=blocks, group_ids=gids
+        blocks=blocks, group_ids=gids, pdf_url=l.pdf_url
     )
 
 @app.get("/api/lessons/accessible/{tg_id}", response_model=list[LessonOut])
@@ -446,6 +477,34 @@ async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_ses
             status=l.status, publish_at=l.publish_at
         ) for l in lessons
     ]
+
+
+@app.post("/api/lessons/{lesson_id}/pdf", status_code=201)
+async def upload_lesson_pdf(lesson_id: int, file: UploadFile = File(...), session: AsyncSession = Depends(get_session)):
+    # проверим наличие урока
+    l = await session.get(Lesson, lesson_id)
+    if not l:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+
+    # проверим тип
+    if file.content_type not in ("application/pdf",):
+        raise HTTPException(status_code=415, detail="Only PDF is allowed")
+
+    # сохраним файл
+    folder = Path("uploads/pdfs")
+    folder.mkdir(parents=True, exist_ok=True)
+    fname = f"{uuid4().hex}.pdf"
+    fpath = folder / fname
+
+    content = await file.read()
+    with open(fpath, "wb") as f:
+        f.write(content)
+
+    # проставим ссылку
+    l.pdf_url = f"/files/pdfs/{fname}"
+    await session.commit()
+
+    return {"status": "ok", "pdf_url": l.pdf_url}
 
 
 # -------- Roles & Groups --------

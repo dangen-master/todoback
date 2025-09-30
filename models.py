@@ -126,6 +126,8 @@ class Lesson(Base):
     status: Mapped[str] = mapped_column(LessonStatusEnum, nullable=False, server_default=text("'draft'"))
     publish_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=False))  # доступно с этой даты/времени
 
+    pdf_url: Mapped[Optional[str]] = mapped_column(Text)
+
     group_id: Mapped[Optional[int]] = mapped_column(FK_INT, ForeignKey("groups.id", ondelete="SET NULL"))
     group: Mapped[Optional["Group"]] = relationship("Group", back_populates="lessons")
 
