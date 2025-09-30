@@ -16,14 +16,29 @@ async def _get_or_create_role(session: AsyncSession, code: str, name: Optional[s
     await session.flush()
     return role
 
-async def _ensure_student_role(session: AsyncSession, user: User) -> None:
-    has_any_role = await session.scalar(select(UserRole).where(UserRole.user_id == user.id).limit(1))
-    if has_any_role:
-        return
-    student = await _get_or_create_role(session, "student", "Student")
-    exists = await session.scalar(select(UserRole).where(UserRole.user_id == user.id, UserRole.role_id == student.id))
-    if not exists:
-        session.add(UserRole(user_id=user.id, role_id=student.id))
+async def _ensure_student_role(session, user: User) -> None:
+    # 1) найдём/создадим саму роль
+    role = await session.scalar(select(Role).where(Role.code == "student"))
+    if role is None:
+        role = Role(code="student", name="Студент")
+        session.add(role)
+        # flush гарантирует role.id
+        await session.flush()
+
+    # 2) проверим членство БЕЗ обращения к user.roles (без lazy-load)
+    #    через явный запрос с join по связи User.roles
+    is_member = await session.scalar(
+        select(Role.id)
+        .join(User.roles)
+        .where(User.id == user.id, Role.id == role.id)
+        .limit(1)
+    )
+
+    # 3) если ещё не состоит — добавим и зафлашим
+    if is_member is None:
+        # это безопасно: без ленивой загрузки; append сработает
+        user.roles.append(role)
+        await session.flush()
 
 # --- public api ------------------------------------------------------------
 async def ensure_user(session: AsyncSession, tg_id: int, *, username: Optional[str] = None,
@@ -66,7 +81,7 @@ async def list_users(session: AsyncSession) -> list[User]:
     return result.scalars().all()
 
 class GroupAlreadyExistsError(Exception): ...
-async def get_user_profile(session: AsyncSession, tg_id: int) -> User | None:
+async def get_user_profile(session, tg_id: int) -> User | None:
     return await session.scalar(
         select(User)
         .options(selectinload(User.roles), selectinload(User.groups))
