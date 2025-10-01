@@ -16,7 +16,12 @@ from repositories import users as users_repo
 from repositories import subjects as subjects_repo
 from repositories import lessons as lessons_repo
 from models import Lesson
-
+try:
+    # pydantic v2 стиль
+    from pydantic import ConfigDict
+    V2 = True
+except Exception:
+    V2 = False
 
 # ---------- DB session ----------
 async def get_session() -> AsyncIterator[AsyncSession]:
@@ -197,7 +202,8 @@ class LessonBlockOut(BaseModel):
 class LessonOut(BaseModel):
     id: int
     title: str
-    publish_at: Optional[str] = None
+    status: Optional[str] = None              # ← это поле ты уже возвращаешь в нескольких ручках
+    publish_at: Optional[datetime] = None     # ← было str, стало datetime
     subject_id: Optional[int] = None
     subject_name: Optional[str] = None
     group_ids: List[int] = []
@@ -205,8 +211,11 @@ class LessonOut(BaseModel):
     pdf_filename: Optional[str] = None
     blocks: Optional[List[Any]] = None
 
-    class Config:
-        orm_mode = True
+    if V2:
+        model_config = ConfigDict(from_attributes=True)  # pydantic v2
+    else:
+        class Config:  # pydantic v1 fallback
+            orm_mode = True
 
 class LessonDetailOut(LessonOut):
     blocks: list[LessonBlockOut]
