@@ -196,11 +196,17 @@ class LessonBlockOut(BaseModel):
 
 class LessonOut(BaseModel):
     id: int
-    subject_id: int
     title: str
-    status: str
-    publish_at: datetime | None = None
+    publish_at: Optional[str] = None
+    subject_id: Optional[int] = None
+    subject_name: Optional[str] = None
+    group_ids: List[int] = []
     pdf_url: Optional[str] = None
+    pdf_filename: Optional[str] = None
+    blocks: Optional[List[Any]] = None
+
+    class Config:
+        orm_mode = True
 
 class LessonDetailOut(LessonOut):
     blocks: list[LessonBlockOut]
@@ -229,6 +235,24 @@ class LessonListItemOut(BaseModel):
     status: str
     publish_at: Optional[datetime] = None
     group_ids: list[int]
+
+async def _can_view_lesson(session: AsyncSession, tg_id: Optional[int], lesson_group_ids: list[int]) -> bool:
+    # «для всех» — видно всем, даже без пользователя
+    if not lesson_group_ids:
+        return True
+    if not tg_id:
+        return False
+
+    prof = await users_repo.get_user_profile(session, tg_id)
+    if not prof:
+        return False
+
+    role_codes = {r.code for r in prof.roles}
+    if "admin" in role_codes or "teacher" in role_codes:
+        return True
+
+    user_group_ids = {g.id for g in prof.groups}
+    return any(gid in user_group_ids for gid in lesson_group_ids)
 
 # ---------- Endpoints ----------
 @app.get("/api/health")
@@ -465,6 +489,41 @@ async def upload_lesson_pdf(lesson_id: int, file: UploadFile = File(...), sessio
 
     return {"status": "ok", "pdf_url": l.pdf_url}
 
+@app.get("/api/lessons/{lesson_id}", response_model=LessonDetailOut)
+async def get_lesson_by_id(
+    lesson_id: int,
+    session: AsyncSession = Depends(get_session),
+    x_debug_tg_id: Optional[int] = Header(None, alias="X-Debug-Tg-Id"),
+):
+    # забираем урок + связанные группы через репозиторий (у тебя уже есть эта функция)
+    row = await lessons_repo.get_lesson_detail(session, lesson_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+
+    l, gids = row  # l: Lesson, gids: list[int]
+
+    # проверим доступ
+    if not await _can_view_lesson(session, x_debug_tg_id, gids):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # соберём блоки в уже используемую схему
+    blocks = [
+        LessonBlockOut(
+            position=b.position, type=b.type, text=b.text,
+            image_url=b.image_url, caption=b.caption
+        )
+        for b in l.blocks
+    ]
+    return LessonDetailOut(
+        id=l.id,
+        subject_id=l.subject_id,
+        title=l.title,
+        status=l.status,
+        publish_at=l.publish_at,
+        blocks=blocks,
+        group_ids=gids,
+        pdf_url=l.pdf_url,
+    )
 
 # -------- Roles & Groups --------
 @app.get("/api/roles", dependencies=[Depends(require_roles("admin", "teacher"))])
