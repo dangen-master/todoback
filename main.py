@@ -63,9 +63,10 @@ app.add_middleware(
         "https://web.telegram.org",
         "https://telegram.org",
         "https://*.telegram.org",
+        "https://telegrammapp-44890.web.app"
     ],
     allow_origin_regex=r"^https:\/\/.*\.telegram\.org$",
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
