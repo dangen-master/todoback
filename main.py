@@ -5,7 +5,7 @@ from datetime import datetime
 from uuid import uuid4
 from pathlib import Path
 
-from fastapi import FastAPI, Depends, HTTPException, status, Header, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, status, Header, UploadFile, File, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator,  AliasChoices, ConfigDict, model_validator
@@ -22,6 +22,8 @@ try:
     V2 = True
 except Exception:
     V2 = False
+
+from urllib.parse import urljoin, urlparse  # ← для abs_url
 
 # ---------- DB session ----------
 async def get_session() -> AsyncIterator[AsyncSession]:
@@ -70,6 +72,20 @@ app.add_middleware(
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/files", StaticFiles(directory=str(UPLOAD_DIR)), name="files")
+
+# ---------- Helpers ----------
+def abs_url(request: Request, maybe_url: Optional[str]) -> Optional[str]:
+    """Сделать URL абсолютным относительно текущего бэкенд-домена.
+    Если уже абсолютный — вернуть как есть.
+    """
+    if not maybe_url:
+        return None
+    parsed = urlparse(maybe_url)
+    if parsed.scheme:
+        return maybe_url
+    base = str(request.base_url)  # уважает ProxyHeadersMiddleware
+    return urljoin(base, maybe_url.lstrip("/"))
+
 # ---------- Schemas ----------
 class EnsureUserIn(BaseModel):
     tg_id: int
@@ -108,13 +124,11 @@ class LessonCreateIn(BaseModel):
     title: str
     publish: bool = False
 
-    # NEW: либо блоки, либо pdf_url
+    # PDF-режим или блоки
     pdf_url: Optional[str] = None
-
-    # было: blocks: List[dict] = Field(default_factory=list)
     blocks: List[dict] = Field(default_factory=list)
 
-    # NEW: чтобы не падать при обращении к этим полям в create_lesson
+    # поля, чтобы не падать при доступе
     publish_at: Optional[datetime] = Field(default=None, validation_alias=AliasChoices("publish_at", "publishAt"))
     group_ids: Optional[list[int]] = Field(default=None, validation_alias=AliasChoices("group_ids", "groupIds"))
     user_tg_ids: Optional[list[int]] = Field(default=None, validation_alias=AliasChoices("user_tg_ids", "userTgIds"))
@@ -138,7 +152,6 @@ class LessonCreateIn(BaseModel):
 
     @model_validator(mode="after")
     def _cast_blocks(self):
-        # если пришёл pdf_url — блоки очищаем (в таком режиме контентом служит PDF)
         if self.pdf_url:
             self.blocks = []
             return self
@@ -202,8 +215,8 @@ class LessonBlockOut(BaseModel):
 class LessonOut(BaseModel):
     id: int
     title: str
-    status: Optional[str] = None              # ← это поле ты уже возвращаешь в нескольких ручках
-    publish_at: Optional[datetime] = None     # ← было str, стало datetime
+    status: Optional[str] = None              # используется в нескольких ручках
+    publish_at: Optional[datetime] = None     # datetime → Pydantic сам сериализует в ISO
     subject_id: Optional[int] = None
     subject_name: Optional[str] = None
     group_ids: List[int] = []
@@ -371,7 +384,7 @@ async def subject_lessons(subject_id: int, session: AsyncSession = Depends(get_s
 
 # -------- Lessons --------
 @app.post("/api/lessons", response_model=LessonOut, status_code=status.HTTP_201_CREATED)
-async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends(get_session)):
+async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends(get_session), request: Request = None):
     blocks = [{"type": b.type, "text": b.text, "image_url": b.image_url, "caption": b.caption} for b in getattr(payload, "blocks", [])]
 
     try:
@@ -388,7 +401,7 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
     except lessons_repo.PayloadInvalidError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    # NEW: если это «pdf-урок» — проставим ссылку
+    # Если это «pdf-урок» — проставим ссылку
     if payload.pdf_url:
         db_lesson = await session.get(Lesson, lesson.id)
         db_lesson.pdf_url = payload.pdf_url
@@ -405,17 +418,18 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
 
     await session.commit()
 
-    # NEW: вернём pdf_url тоже
+    # Нормализуем pdf_url в абсолютный
+    lesson.pdf_url = abs_url(request, lesson.pdf_url)
+
     return LessonOut(
         id=lesson.id, subject_id=lesson.subject_id, title=lesson.title,
         status=lesson.status, publish_at=lesson.publish_at, pdf_url=lesson.pdf_url
     )
 
-
 @app.patch("/api/lessons/{lesson_id}",
            dependencies=[Depends(require_roles("admin", "teacher"))],
            response_model=LessonDetailOut)
-async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSession = Depends(get_session)):
+async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSession = Depends(get_session), request: Request = None):
     blocks_payload = None
     if body.blocks is not None:
         blocks_payload = [{"type": b.type, "text": b.text, "image_url": b.image_url, "caption": b.caption} for b in body.blocks]
@@ -452,11 +466,11 @@ async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSessio
     ]
     return LessonDetailOut(
         id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at,
-        blocks=blocks, group_ids=gids, pdf_url=l.pdf_url
+        blocks=blocks, group_ids=gids, pdf_url=abs_url(request, l.pdf_url)
     )
 
 @app.get("/api/lessons/accessible/{tg_id}", response_model=list[LessonOut])
-async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session)):
+async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session), request: Request = None):
     user = await users_repo.get_user_by_tg(session, tg_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -465,14 +479,13 @@ async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_ses
     return [
         LessonOut(
             id=l.id, subject_id=l.subject_id, title=l.title,
-            status=l.status, publish_at=l.publish_at, pdf_url=l.pdf_url
+            status=l.status, publish_at=l.publish_at, pdf_url=abs_url(request, l.pdf_url)
         )
         for l in lessons
     ]
 
-
 @app.post("/api/lessons/{lesson_id}/pdf", status_code=201)
-async def upload_lesson_pdf(lesson_id: int, file: UploadFile = File(...), session: AsyncSession = Depends(get_session)):
+async def upload_lesson_pdf(lesson_id: int, file: UploadFile = File(...), session: AsyncSession = Depends(get_session), request: Request = None):
     # проверим наличие урока
     l = await session.get(Lesson, lesson_id)
     if not l:
@@ -492,8 +505,8 @@ async def upload_lesson_pdf(lesson_id: int, file: UploadFile = File(...), sessio
     with open(fpath, "wb") as f:
         f.write(content)
 
-    # проставим ссылку
-    l.pdf_url = f"/files/pdfs/{fname}"
+    # проставим ссылку (абсолютный URL)
+    l.pdf_url = abs_url(request, f"/files/pdfs/{fname}")
     await session.commit()
 
     return {"status": "ok", "pdf_url": l.pdf_url}
@@ -503,6 +516,7 @@ async def get_lesson_by_id(
     lesson_id: int,
     session: AsyncSession = Depends(get_session),
     x_debug_tg_id: Optional[int] = Header(None, alias="X-Debug-Tg-Id"),
+    request: Request = None,
 ):
     # забираем урок + связанные группы через репозиторий (у тебя уже есть эта функция)
     row = await lessons_repo.get_lesson_detail(session, lesson_id)
@@ -531,7 +545,7 @@ async def get_lesson_by_id(
         publish_at=l.publish_at,
         blocks=blocks,
         group_ids=gids,
-        pdf_url=l.pdf_url,
+        pdf_url=abs_url(request, l.pdf_url),
     )
 
 # -------- Roles & Groups --------
