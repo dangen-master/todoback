@@ -7,6 +7,7 @@ from sqlalchemy.orm import selectinload
 from models import User, Role, UserRole, Group, GroupMember
 
 # --- helpers ---------------------------------------------------------------
+
 async def _get_or_create_role(session: AsyncSession, code: str, name: Optional[str] = None) -> Role:
     role = await session.scalar(select(Role).where(Role.code == code))
     if role:
@@ -16,26 +17,24 @@ async def _get_or_create_role(session: AsyncSession, code: str, name: Optional[s
     await session.flush()
     return role
 
-async def _ensure_student_role(session, user: User) -> None:
-    # 1) найти/создать роль "student"
-    role = await session.scalar(select(Role).where(Role.code == "student"))
-    if role is None:
-        role = Role(code="student", name="Студент")
-        session.add(role)
-        await session.flush()  # нужен role.id
 
-    # 2) проверка членства БЕЗ user.roles (никакого lazy-load)
-    is_member = await session.scalar(
-        select(Role.id)
-        .join(User.roles)                 # связь User.roles
-        .where(User.id == user.id, Role.id == role.id)
-        .limit(1)
+async def _ensure_student_role(session: AsyncSession, user: User) -> None:
+    # если есть хоть одна роль — выходим (но это опционально)
+    has_any = await session.scalar(
+        select(UserRole).where(UserRole.user_id == user.id).limit(1)
     )
+    if has_any:
+        return
 
-    # 3) если ещё не состоит — добавляем
-    if is_member is None:
-        user.roles.append(role)
-        await session.flush()
+    student = await _get_or_create_role(session, "student", "Student")
+    exists = await session.scalar(
+        select(UserRole).where(
+            UserRole.user_id == user.id, UserRole.role_id == student.id
+        )
+    )
+    if not exists:
+        session.add(UserRole(user_id=user.id, role_id=student.id))
+        await session.flush()  # гарантируем запись до commit()
 
 
 # --- public api ------------------------------------------------------------
@@ -79,7 +78,7 @@ async def list_users(session: AsyncSession) -> list[User]:
     return result.scalars().all()
 
 class GroupAlreadyExistsError(Exception): ...
-async def get_user_profile(session, tg_id: int):
+async def get_user_profile(session: AsyncSession, tg_id: int) -> User | None:
     return await session.scalar(
         select(User)
         .options(selectinload(User.roles), selectinload(User.groups))

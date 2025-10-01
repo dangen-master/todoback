@@ -8,5 +8,6 @@ pip install -r requirements.txt
 
 
 pip install --upgrade pip
-pip install python-multipart
+
+
 uvicorn main:app --reload
