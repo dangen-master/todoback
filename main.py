@@ -4,9 +4,7 @@ from typing import Optional, Any, List, Tuple, Literal
 from datetime import datetime
 from uuid import uuid4
 from pathlib import Path
-import os
 
-from fastapi.responses import FileResponse
 from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,12 +22,6 @@ from models import async_session, init_db, Group, Lesson
 from repositories import users as users_repo
 from repositories import subjects as subjects_repo
 from repositories import lessons as lessons_repo
-
-# ---------- публичный base-домен для абсолютных ссылок ----------
-PUBLIC_BACKEND_URL = os.getenv(
-    "PUBLIC_BACKEND_URL",
-    "https://special-space-yodel-6xgggvwq9vjhr9vq-8000.app.github.dev",
-)
 
 # ---------- DB session ----------
 async def get_session() -> AsyncIterator[AsyncSession]:
@@ -63,16 +55,15 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 (UPLOAD_DIR / "pdfs").mkdir(parents=True, exist_ok=True)
 app.mount("/files", StaticFiles(directory=str(UPLOAD_DIR), html=False), name="files")
 
-# PDF.js (если папка существует — смонтируем на /pdfjs)
-PDFJS_DIR = BASE_DIR / "pdfjs"
-if PDFJS_DIR.exists():
-    app.mount("/pdfjs", StaticFiles(directory=str(PDFJS_DIR), html=True), name="pdfjs")
-
 # ---------- helpers ----------
 from urllib.parse import urljoin, urlparse
 
 def abs_url(request: Request, maybe_url: Optional[str]) -> Optional[str]:
-    """Превращает относительный путь в абсолютный URL от PUBLIC_BACKEND_URL; абсолютный возвращает как есть."""
+    """
+    Делает абсолютный URL:
+    - если уже абсолютный — вернуть как есть;
+    - иначе строим от origin текущего запроса (надёжно для app.github.dev).
+    """
     if not maybe_url:
         return None
     try:
@@ -81,8 +72,8 @@ def abs_url(request: Request, maybe_url: Optional[str]) -> Optional[str]:
             return maybe_url
     except Exception:
         pass
-    base = PUBLIC_BACKEND_URL.rstrip('/') + '/'
-    return urljoin(base, maybe_url.lstrip('/'))
+    origin = str(request.base_url).rstrip("/")
+    return urljoin(origin + "/", maybe_url.lstrip("/"))
 
 # ---------- схемы ----------
 class EnsureUserIn(BaseModel):
@@ -415,7 +406,12 @@ async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSessio
     )
 
 @app.post("/api/lessons/{lesson_id}/pdf", status_code=201, dependencies=[Depends(require_roles("admin","teacher"))])
-async def upload_lesson_pdf(lesson_id: int, file: UploadFile = File(...), session: AsyncSession = Depends(get_session), request: Request = None):
+async def upload_lesson_pdf(
+    lesson_id: int,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+    request: Request = None,
+):
     l = await session.get(Lesson, lesson_id)
     if not l:
         raise HTTPException(status_code=404, detail="Lesson not found")
@@ -423,23 +419,27 @@ async def upload_lesson_pdf(lesson_id: int, file: UploadFile = File(...), sessio
     if file.content_type not in ("application/pdf",):
         raise HTTPException(status_code=415, detail="Only PDF is allowed")
 
+    content = await file.read()
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=415, detail="Not a valid PDF file")
+
     folder = UPLOAD_DIR / "pdfs"
     folder.mkdir(parents=True, exist_ok=True)
     fname = f"{uuid4().hex}.pdf"
     fpath = folder / fname
-
-    content = await file.read()
     with open(fpath, "wb") as f:
         f.write(content)
 
-    # теперь отдаём через inline-ручку
-    l.pdf_url = abs_url(request, f"/pdf/inline/{fname}")
+    # Сохраняем прямую ссылку на статику
+    raw_path = f"/files/pdfs/{fname}"
+    l.pdf_url = abs_url(request, raw_path)
+    l.pdf_filename = file.filename  # если поле есть в модели
     await session.commit()
 
     return {"status": "ok", "pdf_url": l.pdf_url, "pdf_filename": file.filename}
 
 @app.get("/api/lessons/accessible/{tg_id}", response_model=list[LessonOut])
-async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session), request: Request = None):
+async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session)):
     user = await users_repo.get_user_by_tg(session, tg_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
