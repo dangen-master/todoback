@@ -6,10 +6,11 @@ from uuid import uuid4
 from pathlib import Path
 import os
 
-from fastapi import FastAPI, Depends, HTTPException, status, Header, UploadFile, File, Request
+from fastapi.responses import FileResponse
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 try:
     from pydantic import ConfigDict  # pydantic v2
     V2 = True
@@ -18,16 +19,15 @@ except Exception:
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# ---- твои модели/репозитории ----
-from models import async_session, init_db, Group, Lesson  # Group и Lesson берем из моделей
+# ---- модели/репозитории ----
+from models import async_session, init_db, Group, Lesson
 from repositories import users as users_repo
 from repositories import subjects as subjects_repo
 from repositories import lessons as lessons_repo
 
-# ---------- PUBLIC BASE (важно для абсолютных ссылок) ----------
+# ---------- публичный base-домен для абсолютных ссылок ----------
 PUBLIC_BACKEND_URL = os.getenv(
     "PUBLIC_BACKEND_URL",
-    # ← подставь свой публичный https-домен бэкенда, если меняется — только ENV
     "https://special-space-yodel-6xgggvwq9vjhr9vq-8000.app.github.dev",
 )
 
@@ -36,7 +36,7 @@ async def get_session() -> AsyncIterator[AsyncSession]:
     async with async_session() as session:
         yield session
 
-# ---------- Lifespan ----------
+# ---------- lifespan ----------
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
     await init_db()
@@ -49,7 +49,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://telegrammapp-44890.web.app",
-        "https://*.app.github.dev",           # для Codespaces/Preview
+        "https://*.app.github.dev",
     ],
     allow_origin_regex=r"https://.*\.app\.github\.dev",
     allow_credentials=True,
@@ -58,21 +58,21 @@ app.add_middleware(
 )
 
 # ---------- static ----------
-
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 (UPLOAD_DIR / "pdfs").mkdir(parents=True, exist_ok=True)
-
-# html=False, чтобы точно не пытался отдавать index.html
 app.mount("/files", StaticFiles(directory=str(UPLOAD_DIR), html=False), name="files")
+
+# PDF.js (если папка существует — смонтируем на /pdfjs)
+PDFJS_DIR = BASE_DIR / "pdfjs"
+if PDFJS_DIR.exists():
+    app.mount("/pdfjs", StaticFiles(directory=str(PDFJS_DIR), html=True), name="pdfjs")
 
 # ---------- helpers ----------
 from urllib.parse import urljoin, urlparse
 
 def abs_url(request: Request, maybe_url: Optional[str]) -> Optional[str]:
-    """Вернуть абсолютный URL от публичного домена бэкенда.
-    Если уже абсолютный — вернуть как есть.
-    """
+    """Превращает относительный путь в абсолютный URL от PUBLIC_BACKEND_URL; абсолютный возвращает как есть."""
     if not maybe_url:
         return None
     try:
@@ -84,7 +84,7 @@ def abs_url(request: Request, maybe_url: Optional[str]) -> Optional[str]:
     base = PUBLIC_BACKEND_URL.rstrip('/') + '/'
     return urljoin(base, maybe_url.lstrip('/'))
 
-# ---------- Schemas ----------
+# ---------- схемы ----------
 class EnsureUserIn(BaseModel):
     tg_id: int
     username: Optional[str] = None
@@ -193,7 +193,7 @@ class GroupCreateIn(BaseModel):
 class GroupPatchIn(BaseModel):
     name: str
 
-# ---------- Auth helpers ----------
+# ---------- auth ----------
 async def get_current_user(
     session: AsyncSession = Depends(get_session),
     x_debug_tg_id: Optional[int] = Header(None, alias="X-Debug-Tg-Id"),
@@ -232,12 +232,12 @@ async def _can_view_lesson(session: AsyncSession, tg_id: Optional[int], lesson_g
     my_groups = {g.id for g in prof.groups}
     return any(g in my_groups for g in lesson_group_ids)
 
-# ---------- Basic ----------
+# ---------- basic ----------
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
 
-# ---------- Users ----------
+# ---------- users ----------
 @app.post("/api/user/ensure", response_model=UserProfileOut)
 async def api_ensure_user(data: EnsureUserIn, session: AsyncSession = Depends(get_session)):
     await users_repo.ensure_user(
@@ -281,7 +281,7 @@ async def list_users(session: AsyncSession = Depends(get_session)):
         } for u in users
     ]
 
-# ---------- Subjects ----------
+# ---------- subjects ----------
 @app.get("/api/subjects", response_model=list[SubjectOut])
 async def list_subjects(session: AsyncSession = Depends(get_session)):
     rows = await subjects_repo.list_subjects_with_group_ids(session)
@@ -322,7 +322,7 @@ async def subject_lessons(subject_id: int, session: AsyncSession = Depends(get_s
         for (l, gids) in rows
     ]
 
-# ---------- Lessons ----------
+# ---------- lessons ----------
 async def _blocks_out(l: Lesson) -> list[LessonBlockOut]:
     return [
         LessonBlockOut(position=b.position, type=b.type, text=b.text, image_url=b.image_url, caption=b.caption)
@@ -341,7 +341,7 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
             session,
             subject_id=payload.subject_id,
             title=payload.title,
-            blocks=blocks_payload if not payload.pdf_url else [],  # если есть pdf, блоки игнорим
+            blocks=blocks_payload if not payload.pdf_url else [],
             publish=payload.publish,
             publish_at=payload.publish_at,
         )
@@ -352,7 +352,7 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
 
     if payload.pdf_url:
         db_l = await session.get(Lesson, lesson.id)
-        db_l.pdf_url = abs_url(request, payload.pdf_url)  # на всякий случай делаем абсолютным
+        db_l.pdf_url = abs_url(request, payload.pdf_url)
         lesson.pdf_url = db_l.pdf_url
 
     if payload.group_ids is not None:
@@ -370,7 +370,7 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
     return LessonOut(
         id=lesson.id, subject_id=lesson.subject_id, title=lesson.title,
         status=lesson.status, publish_at=lesson.publish_at,
-        pdf_url=lesson.pdf_url,  # уже абсолютный
+        pdf_url=lesson.pdf_url,
     )
 
 @app.patch("/api/lessons/{lesson_id}", response_model=LessonDetailOut, dependencies=[Depends(require_roles("admin","teacher"))])
@@ -432,8 +432,8 @@ async def upload_lesson_pdf(lesson_id: int, file: UploadFile = File(...), sessio
     with open(fpath, "wb") as f:
         f.write(content)
 
-    # относительный путь -> абсолютный url от публичного домена
-    l.pdf_url = abs_url(request, f"/files/pdfs/{fname}")
+    # теперь отдаём через inline-ручку
+    l.pdf_url = abs_url(request, f"/pdf/inline/{fname}")
     await session.commit()
 
     return {"status": "ok", "pdf_url": l.pdf_url, "pdf_filename": file.filename}
@@ -447,7 +447,7 @@ async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_ses
     return [
         LessonOut(
             id=l.id, subject_id=l.subject_id, title=l.title,
-            status=l.status, publish_at=l.publish_at, pdf_url=l.pdf_url  # уже абсолютный
+            status=l.status, publish_at=l.publish_at, pdf_url=l.pdf_url
         )
         for l in lessons
     ]
@@ -469,7 +469,7 @@ async def get_lesson_by_id(
         blocks=await _blocks_out(l), group_ids=gids, pdf_url=l.pdf_url
     )
 
-# ---------- Roles ----------
+# ---------- roles ----------
 @app.get("/api/roles", dependencies=[Depends(require_roles("admin","teacher"))])
 async def get_roles(session: AsyncSession = Depends(get_session)):
     rows = await users_repo.list_roles_with_members(session)
@@ -496,7 +496,7 @@ async def remove_role_member(role: str, tg_id: int, session: AsyncSession = Depe
     await session.commit()
     return {"status": "ok"}
 
-# ---------- Groups ----------
+# ---------- groups ----------
 @app.get("/api/groups", dependencies=[Depends(require_roles("admin","teacher"))])
 async def list_groups(session: AsyncSession = Depends(get_session)):
     groups = await users_repo.list_groups_with_members(session)
