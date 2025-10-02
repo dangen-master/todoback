@@ -4,6 +4,8 @@ from typing import Optional, Any, List, Tuple, Literal
 from datetime import datetime
 from uuid import uuid4
 from pathlib import Path
+import os
+
 
 from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Request
 from fastapi.staticfiles import StaticFiles
@@ -23,6 +25,11 @@ from repositories import users as users_repo
 from repositories import subjects as subjects_repo
 from repositories import lessons as lessons_repo
 
+
+PUBLIC_BACKEND_URL = os.getenv(
+    "PUBLIC_BACKEND_URL",
+    "https://special-space-yodel-6xgggvwq9vjhr9vq-8000.app.github.dev",
+)
 # ---------- DB session ----------
 async def get_session() -> AsyncIterator[AsyncSession]:
     async with async_session() as session:
@@ -61,19 +68,29 @@ from urllib.parse import urljoin, urlparse
 def abs_url(request: Request, maybe_url: Optional[str]) -> Optional[str]:
     """
     Делает абсолютный URL:
-    - если уже абсолютный — вернуть как есть;
-    - иначе строим от origin текущего запроса (надёжно для app.github.dev).
+    - если maybe_url уже абсолютный — вернуть как есть;
+    - иначе строим от PUBLIC_BACKEND_URL (если задан),
+      иначе — от origin текущего запроса.
     """
     if not maybe_url:
         return None
+
+    # уже абсолютная?
     try:
         parsed = urlparse(maybe_url)
         if parsed.scheme:
             return maybe_url
     except Exception:
         pass
-    origin = str(request.base_url).rstrip("/")
-    return urljoin(origin + "/", maybe_url.lstrip("/"))
+
+    base = (PUBLIC_BACKEND_URL or "").strip()
+    if base:
+        base = base.rstrip("/") + "/"
+        return urljoin(base, maybe_url.lstrip("/"))
+
+    # фолбэк на фактический origin (локалка/дев-сервер)
+    origin = str(request.base_url).rstrip("/") + "/"
+    return urljoin(origin, maybe_url.lstrip("/"))
 
 # ---------- схемы ----------
 class EnsureUserIn(BaseModel):
@@ -425,17 +442,18 @@ async def upload_lesson_pdf(
 
     folder = UPLOAD_DIR / "pdfs"
     folder.mkdir(parents=True, exist_ok=True)
+
     fname = f"{uuid4().hex}.pdf"
     fpath = folder / fname
     with open(fpath, "wb") as f:
         f.write(content)
 
-    # Сохраняем прямую ссылку на статику
-    raw_path = f"/files/pdfs/{fname}"
-    l.pdf_url = abs_url(request, raw_path)
-    l.pdf_filename = file.filename  # если поле есть в модели
-    await session.commit()
+    # формируем ссылку через abs_url → отдаст PUBLIC_BACKEND_URL при его наличии
+    rel_path = f"/files/pdfs/{fname}"
+    l.pdf_url = abs_url(request, rel_path)
+    l.pdf_filename = file.filename if hasattr(l, "pdf_filename") else None
 
+    await session.commit()
     return {"status": "ok", "pdf_url": l.pdf_url, "pdf_filename": file.filename}
 
 @app.get("/api/lessons/accessible/{tg_id}", response_model=list[LessonOut])
