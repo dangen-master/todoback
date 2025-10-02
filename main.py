@@ -58,9 +58,13 @@ app.add_middleware(
 )
 
 # ---------- static ----------
-UPLOAD_DIR = Path("uploads")
+
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"
 (UPLOAD_DIR / "pdfs").mkdir(parents=True, exist_ok=True)
-app.mount("/files", StaticFiles(directory=str(UPLOAD_DIR)), name="files")
+
+# html=False, чтобы точно не пытался отдавать index.html
+app.mount("/files", StaticFiles(directory=str(UPLOAD_DIR), html=False), name="files")
 
 # ---------- helpers ----------
 from urllib.parse import urljoin, urlparse
@@ -541,4 +545,3 @@ async def delete_group(group_id: int, session: AsyncSession = Depends(get_sessio
     await session.delete(g)
     await session.commit()
     return None
-ы
