@@ -5,6 +5,7 @@ from datetime import datetime
 from uuid import uuid4
 from pathlib import Path
 import os
+from pdf_to_html import pdf_to_html  
 
 
 from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Request
@@ -24,7 +25,7 @@ from models import async_session, init_db, Group, Lesson
 from repositories import users as users_repo
 from repositories import subjects as subjects_repo
 from repositories import lessons as lessons_repo
-
+from tempfile import NamedTemporaryFile
 
 PUBLIC_BACKEND_URL = os.getenv(
     "PUBLIC_BACKEND_URL",
@@ -151,6 +152,7 @@ class LessonCreateIn(BaseModel):
     user_tg_ids: Optional[list[int]] = None
     pdf_url: Optional[str] = None
     blocks: Optional[list[LessonBlockIn]] = None
+    html_content: Optional[str] = None
 
 class LessonPatchIn(BaseModel):
     title: Optional[str] = None
@@ -160,6 +162,7 @@ class LessonPatchIn(BaseModel):
     user_tg_ids: Optional[list[int]] = None
     pdf_url: Optional[str] = None
     blocks: Optional[list[LessonBlockIn]] = None
+    html_content: Optional[str] = None
 
 class LessonOut(BaseModel):
     id: int
@@ -176,10 +179,12 @@ class LessonOut(BaseModel):
         model_config = ConfigDict(from_attributes=True)
     else:
         class Config: orm_mode = True
+    html_content: Optional[str] = None
 
 class LessonDetailOut(LessonOut):
     blocks: list[LessonBlockOut] = []
     group_ids: list[int] = []
+    html_content: Optional[str] = None
 
 class LessonListItemOut(BaseModel):
     id: int
@@ -331,6 +336,40 @@ async def subject_lessons(subject_id: int, session: AsyncSession = Depends(get_s
     ]
 
 # ---------- lessons ----------
+@app.post("/api/lessons/{lesson_id}/pdf-html",
+          status_code=200,
+          dependencies=[Depends(require_roles("admin","teacher"))])
+async def upload_pdf_and_convert_to_html(
+    lesson_id: int,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+):
+    # 1) Валидируем урок
+    l = await session.get(Lesson, lesson_id)
+    if not l:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+
+    # 2) Проверяем тип
+    if file.content_type not in ("application/pdf",):
+        raise HTTPException(status_code=415, detail="Only PDF is allowed")
+
+    content = await file.read()
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=415, detail="Not a valid PDF")
+
+    # 3) Конвертируем во временный файл → HTML (через твою функцию)
+    with NamedTemporaryFile(suffix=".pdf") as tmp:
+        tmp.write(content)
+        tmp.flush()
+        html = pdf_to_html(Path(tmp.name), scale=96/72, image_mode="auto", clip_oversample=2.0, debug=False)
+
+    # 4) Сохраняем в урок
+    l.html_content = html
+    await session.commit()
+
+    # 5) Возвращаем html (и флаг)
+    return {"status": "ok", "html_saved": True, "length": len(html)}
+
 async def _blocks_out(l: Lesson) -> list[LessonBlockOut]:
     return [
         LessonBlockOut(position=b.position, type=b.type, text=b.text, image_url=b.image_url, caption=b.caption)
@@ -372,14 +411,19 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
             u = await users_repo.ensure_user(session, tg)
             ids.append(u.id)
         await lessons_repo.update_lesson(session, lesson_id=lesson.id, user_ids=ids)
+    
+    if payload.html_content is not None:
+        db_l = await session.get(Lesson, lesson.id)
+        db_l.html_content = payload.html_content
 
     await session.commit()
 
     return LessonOut(
         id=lesson.id, subject_id=lesson.subject_id, title=lesson.title,
         status=lesson.status, publish_at=lesson.publish_at,
-        pdf_url=lesson.pdf_url,
+        pdf_url=lesson.pdf_url, html_content=getattr(lesson, "html_content", None),  # NEW
     )
+
 
 @app.patch("/api/lessons/{lesson_id}", response_model=LessonDetailOut, dependencies=[Depends(require_roles("admin","teacher"))])
 async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSession = Depends(get_session), request: Request = None):
@@ -414,13 +458,19 @@ async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSessio
         db_l = await session.get(Lesson, lesson_id)
         db_l.pdf_url = abs_url(request, body.pdf_url)
 
+    if body.html_content is not None:
+        db_l = await session.get(Lesson, lesson_id)
+        db_l.html_content = body.html_content
+
     await session.commit()
 
     l, gids = await lessons_repo.get_lesson_detail(session, lesson_id)
     return LessonDetailOut(
         id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at,
-        blocks=await _blocks_out(l), group_ids=gids, pdf_url=l.pdf_url
+        blocks=await _blocks_out(l), group_ids=gids,
+        pdf_url=l.pdf_url, html_content=getattr(l, "html_content", None),  # NEW
     )
+
 
 @app.post("/api/lessons/{lesson_id}/pdf", status_code=201, dependencies=[Depends(require_roles("admin","teacher"))])
 async def upload_lesson_pdf(
@@ -472,10 +522,10 @@ async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_ses
 
 @app.get("/api/lessons/{lesson_id}", response_model=LessonDetailOut)
 async def get_lesson_by_id(
-    lesson_id: int,
-    session: AsyncSession = Depends(get_session),
-    x_debug_tg_id: Optional[int] = Header(None, alias="X-Debug-Tg-Id"),
-):
+        lesson_id: int,
+        session: AsyncSession = Depends(get_session),
+        x_debug_tg_id: Optional[int] = Header(None, alias="X-Debug-Tg-Id"),
+    ):
     row: Optional[Tuple[Lesson, List[int]]] = await lessons_repo.get_lesson_detail(session, lesson_id)
     if not row:
         raise HTTPException(status_code=404, detail="Lesson not found")
@@ -483,8 +533,15 @@ async def get_lesson_by_id(
     if not await _can_view_lesson(session, x_debug_tg_id, gids):
         raise HTTPException(status_code=403, detail="Forbidden")
     return LessonDetailOut(
-        id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at,
-        blocks=await _blocks_out(l), group_ids=gids, pdf_url=l.pdf_url
+        id=l.id,
+        subject_id=l.subject_id,
+        title=l.title,
+        status=l.status,
+        publish_at=l.publish_at,
+        blocks=await _blocks_out(l),
+        group_ids=gids,
+        pdf_url=l.pdf_url,
+        html_content=getattr(l, "html_content", None),
     )
 
 # ---------- roles ----------
