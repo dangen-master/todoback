@@ -77,6 +77,13 @@ async def get_subject_group_ids(session, subject_id: int) -> list[int]:
     )
     return [r[0] for r in rows.all()]
 
+async def delete_subject(session, subject_id: int) -> bool:
+    s = await session.get(Subject, subject_id)
+    if not s:
+        return False
+    await session.delete(s)
+    # коммитим на уровне API
+    return True
 # --- Выборки уроков по предмету --------------------------------------------
 
 async def list_subject_lessons(session: AsyncSession, subject_id: int) -> list[Lesson]:

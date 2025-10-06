@@ -194,3 +194,20 @@ async def list_subject_lessons_with_group_ids(session: AsyncSession, subject_id:
         mapping.setdefault(lid, []).append(gid)
 
     return [(l, mapping.get(l.id, [])) for l in lessons]
+
+
+async def delete_lesson(session, lesson_id: int) -> bool:
+    l = await session.get(Lesson, lesson_id)
+    if not l:
+        return False
+    await session.delete(l)
+    # коммитим на уровне API
+    return True
+
+async def delete_lessons_by_subject(session, subject_id: int) -> int:
+    # вернёт количество удалённых строк
+    result = await session.execute(
+        delete(Lesson).where(Lesson.subject_id == subject_id)
+    )
+    # result.rowcount может быть None в некоторых драйверах; не критично
+    return result.rowcount or 0

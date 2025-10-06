@@ -29,7 +29,7 @@ from tempfile import NamedTemporaryFile
 
 PUBLIC_BACKEND_URL = os.getenv(
     "PUBLIC_BACKEND_URL",
-    "https://special-space-yodel-6xgggvwq9vjhr9vq-8000.app.github.dev",
+    "https://cautious-space-carnival-9g9996wrj7p2p7q6-8000.app.github.dev",
 )
 # ---------- DB session ----------
 async def get_session() -> AsyncIterator[AsyncSession]:
@@ -335,6 +335,27 @@ async def subject_lessons(subject_id: int, session: AsyncSession = Depends(get_s
         for (l, gids) in rows
     ]
 
+@app.delete(
+    "/api/subjects/{subject_id}",
+    status_code=204,
+    dependencies=[Depends(require_roles("admin","teacher"))],
+)
+async def delete_subject_api(
+    subject_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    # сначала удаляем все уроки этого предмета (безопасно, если FK без CASCADE)
+    await lessons_repo.delete_lessons_by_subject(session, subject_id)
+
+    ok = await subjects_repo.delete_subject(session, subject_id)
+    if not ok:
+        # если предмета нет — откатим удаление уроков, чтобы не коммитить пустую операцию
+        await session.rollback()
+        raise HTTPException(status_code=404, detail="Subject not found")
+
+    await session.commit()
+    return None
+
 # ---------- lessons ----------
 @app.post("/api/lessons/{lesson_id}/pdf-html",
           status_code=200,
@@ -543,6 +564,23 @@ async def get_lesson_by_id(
         pdf_url=l.pdf_url,
         html_content=getattr(l, "html_content", None),
     )
+
+
+@app.delete(
+    "/api/lessons/{lesson_id}",
+    status_code=204,
+    dependencies=[Depends(require_roles("admin","teacher"))],
+)
+async def delete_lesson_api(
+    lesson_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    ok = await lessons_repo.delete_lesson(session, lesson_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Lesson not found")
+    await session.commit()
+    return None
+
 
 # ---------- roles ----------
 @app.get("/api/roles", dependencies=[Depends(require_roles("admin","teacher"))])
