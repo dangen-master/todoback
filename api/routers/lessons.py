@@ -18,26 +18,29 @@ from pdf_to_html import pdf_to_html
 
 router = APIRouter(tags=["lessons"])
 
+
 async def _blocks_out(l: Lesson) -> list[LessonBlockOut]:
     return [
         LessonBlockOut(position=b.position, type=b.type, text=b.text, image_url=b.image_url, caption=b.caption)
         for b in (l.blocks or [])
     ]
 
-@router.post("/api/lessons/{lesson_id}/pdf-html",
-             status_code=200,
-             dependencies=[Depends(require_roles("admin","teacher"))])
+
+@router.post(
+    "/lessons/{lesson_id}/pdf-html",
+    status_code=200,
+    dependencies=[Depends(require_roles("admin", "teacher"))],
+)
 async def upload_pdf_and_convert_to_html(
     lesson_id: int,
+    request: Request,                               # <-- не-дефолтный параметр ДО параметров с умолчаниями
     file: UploadFile = File(...),
     session: AsyncSession = Depends(get_session),
-    request: Request | None = None,
 ):
     l = await session.get(Lesson, lesson_id)
     if not l:
         raise HTTPException(status_code=404, detail="Lesson not found")
 
-    # базовые валидации
     if file.content_type not in ("application/pdf",):
         raise HTTPException(status_code=415, detail="Only PDF is allowed")
 
@@ -45,30 +48,30 @@ async def upload_pdf_and_convert_to_html(
     if not content.startswith(b"%PDF-"):
         raise HTTPException(status_code=415, detail="Not a valid PDF")
 
-    # --- КОНВЕРТАЦИЯ ИЗ БАЙТОВ ---
+    # 1) PDF → HTML через временный файл (соответствует интерфейсу pdf_to_html(Path))
     try:
-        html = pdf_to_html(content, scale=96/72, image_mode="auto", clip_oversample=2.0, debug=False)
+        with NamedTemporaryFile(suffix=".pdf") as tmp:
+            tmp.write(content)
+            tmp.flush()
+            html = pdf_to_html(Path(tmp.name), scale=96 / 72, image_mode="auto", clip_oversample=2.0, debug=False)
     except Exception as e:
-        # важна понятная ошибка — чтобы видеть в логах
         raise HTTPException(status_code=500, detail=f"PDF->HTML failed: {e!r}")
 
-    # гарантия непустого результата
     if not isinstance(html, str) or len(html) < 32:
-        # 32 — просто формальная отсечка «совсем пусто/сломалось»
         raise HTTPException(status_code=500, detail="PDF->HTML produced empty output")
 
-    # 2) Сохраняем HTML на диск
+    # 2) Сохраняем HTML-файл в /uploads/htmls
     htmls_dir = UPLOAD_DIR / "htmls"
     htmls_dir.mkdir(parents=True, exist_ok=True)
     fname = f"{uuid4().hex}.html"
     fpath = htmls_dir / fname
     fpath.write_text(html, encoding="utf-8")
 
-    # 3) URL для выдачи (предполагается static-маршрут /files/htmls/*)
+    # 3) Абсолютная ссылка для отдачи статики
     rel_url = f"/files/htmls/{fname}"
     abs_html_url = abs_url(request, rel_url)
 
-    # 4) Кладём в БД (и ссылку, и копию)
+    # 4) Кладём в БД текст и ссылку (если есть поле)
     l.html_content = html
     if hasattr(l, "html_url"):
         l.html_url = abs_html_url
@@ -82,8 +85,18 @@ async def upload_pdf_and_convert_to_html(
         "length": len(html),
     }
 
-@router.post("/lessons", response_model=LessonOut, status_code=201, dependencies=[Depends(require_roles("admin","teacher"))])
-async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends(get_session), request: Request = None):
+
+@router.post(
+    "/lessons",
+    response_model=LessonOut,
+    status_code=201,
+    dependencies=[Depends(require_roles("admin", "teacher"))],
+)
+async def create_lesson(
+    payload: LessonCreateIn,
+    request: Request,                                     # <-- request ДО session
+    session: AsyncSession = Depends(get_session),
+):
     blocks_payload = [
         {"type": b.type, "text": b.text, "image_url": b.image_url, "caption": b.caption}
         for b in (payload.blocks or [])
@@ -126,14 +139,28 @@ async def create_lesson(payload: LessonCreateIn, session: AsyncSession = Depends
     await session.commit()
 
     return LessonOut(
-        id=lesson.id, subject_id=lesson.subject_id, title=lesson.title,
-        status=lesson.status, publish_at=lesson.publish_at,
-        pdf_url=lesson.pdf_url, html_content=getattr(lesson, "html_content", None),
+        id=lesson.id,
+        subject_id=lesson.subject_id,
+        title=lesson.title,
+        status=lesson.status,
+        publish_at=lesson.publish_at,
+        pdf_url=lesson.pdf_url,
+        html_content=getattr(lesson, "html_content", None),
         html_url=getattr(lesson, "html_url", None),
     )
 
-@router.patch("/lessons/{lesson_id}", response_model=LessonDetailOut, dependencies=[Depends(require_roles("admin","teacher"))])
-async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSession = Depends(get_session), request: Request = None):
+
+@router.patch(
+    "/lessons/{lesson_id}",
+    response_model=LessonDetailOut,
+    dependencies=[Depends(require_roles("admin", "teacher"))],
+)
+async def patch_lesson(
+    lesson_id: int,
+    body: LessonPatchIn,
+    request: Request,                                     # <-- request ДО session
+    session: AsyncSession = Depends(get_session),
+):
     blocks_payload = None
     if body.blocks is not None:
         blocks_payload = [
@@ -174,14 +201,30 @@ async def patch_lesson(lesson_id: int, body: LessonPatchIn, session: AsyncSessio
 
     l, gids = await lessons_repo.get_lesson_detail(session, lesson_id)
     return LessonDetailOut(
-        id=l.id, subject_id=l.subject_id, title=l.title, status=l.status, publish_at=l.publish_at,
-        blocks=await _blocks_out(l), group_ids=gids,
-        pdf_url=l.pdf_url, html_content=getattr(l, "html_content", None),
+        id=l.id,
+        subject_id=l.subject_id,
+        title=l.title,
+        status=l.status,
+        publish_at=l.publish_at,
+        blocks=await _blocks_out(l),
+        group_ids=gids,
+        pdf_url=l.pdf_url,
+        html_content=getattr(l, "html_content", None),
         html_url=getattr(l, "html_url", None),
     )
 
-@router.post("/lessons/{lesson_id}/pdf", status_code=201, dependencies=[Depends(require_roles("admin","teacher"))])
-async def upload_lesson_pdf(lesson_id: int, file: UploadFile = File(...), session: AsyncSession = Depends(get_session), request: Request = None):
+
+@router.post(
+    "/lessons/{lesson_id}/pdf",
+    status_code=201,
+    dependencies=[Depends(require_roles("admin", "teacher"))],
+)
+async def upload_lesson_pdf(
+    lesson_id: int,
+    request: Request,                                     # <-- request ДО file/session
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+):
     l = await session.get(Lesson, lesson_id)
     if not l:
         raise HTTPException(status_code=404, detail="Lesson not found")
@@ -206,6 +249,7 @@ async def upload_lesson_pdf(lesson_id: int, file: UploadFile = File(...), sessio
     await session.commit()
     return {"status": "ok", "pdf_url": l.pdf_url, "pdf_filename": file.filename}
 
+
 @router.get("/lessons/accessible/{tg_id}", response_model=list[LessonOut])
 async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session)):
     user = await users_repo.get_user_by_tg(session, tg_id)
@@ -214,17 +258,22 @@ async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_ses
     lessons = await lessons_repo.get_accessible_lessons_for_user(session, user_id=user.id)
     return [
         LessonOut(
-            id=l.id, subject_id=l.subject_id, title=l.title,
-            status=l.status, publish_at=l.publish_at, pdf_url=l.pdf_url
+            id=l.id,
+            subject_id=l.subject_id,
+            title=l.title,
+            status=l.status,
+            publish_at=l.publish_at,
+            pdf_url=l.pdf_url,
         )
         for l in lessons
     ]
+
 
 @router.get("/lessons/{lesson_id}", response_model=LessonDetailOut)
 async def get_lesson_by_id(
     lesson_id: int,
     session: AsyncSession = Depends(get_session),
-    current = Depends(get_current_user),
+    current=Depends(get_current_user),
 ):
     row = await lessons_repo.get_lesson_detail(session, lesson_id)
     if not row:
@@ -233,12 +282,20 @@ async def get_lesson_by_id(
     if not await can_view_lesson(session, current.telegram_id if current else None, gids):
         raise HTTPException(status_code=403, detail="Forbidden")
     return LessonDetailOut(
-        id=l.id, subject_id=l.subject_id, title=l.title, status=l.status,
-        publish_at=l.publish_at, blocks=await _blocks_out(l), group_ids=gids,
-        pdf_url=l.pdf_url, html_content=getattr(l, "html_content", None),
+        id=l.id,
+        subject_id=l.subject_id,
+        title=l.title,
+        status=l.status,
+        publish_at=l.publish_at,
+        blocks=await _blocks_out(l),
+        group_ids=gids,
+        pdf_url=l.pdf_url,
+        html_content=getattr(l, "html_content", None),
+        html_url=getattr(l, "html_url", None),
     )
 
-@router.delete("/lessons/{lesson_id}", status_code=204, dependencies=[Depends(require_roles("admin","teacher"))])
+
+@router.delete("/lessons/{lesson_id}", status_code=204, dependencies=[Depends(require_roles("admin", "teacher"))])
 async def delete_lesson_api(lesson_id: int, session: AsyncSession = Depends(get_session)):
     ok = await lessons_repo.delete_lesson(session, lesson_id)
     if not ok:
