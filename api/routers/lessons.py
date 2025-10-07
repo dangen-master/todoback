@@ -25,18 +25,19 @@ async def _blocks_out(l: Lesson) -> list[LessonBlockOut]:
     ]
 
 @router.post("/api/lessons/{lesson_id}/pdf-html",
-          status_code=200,
-          dependencies=[Depends(require_roles("admin","teacher"))])
+             status_code=200,
+             dependencies=[Depends(require_roles("admin","teacher"))])
 async def upload_pdf_and_convert_to_html(
     lesson_id: int,
     file: UploadFile = File(...),
     session: AsyncSession = Depends(get_session),
-    request: Request = None,   # ✅ чтобы построить абсолютный URL
+    request: Request | None = None,
 ):
     l = await session.get(Lesson, lesson_id)
     if not l:
         raise HTTPException(status_code=404, detail="Lesson not found")
 
+    # базовые валидации
     if file.content_type not in ("application/pdf",):
         raise HTTPException(status_code=415, detail="Only PDF is allowed")
 
@@ -44,11 +45,17 @@ async def upload_pdf_and_convert_to_html(
     if not content.startswith(b"%PDF-"):
         raise HTTPException(status_code=415, detail="Not a valid PDF")
 
-    # 1) PDF → HTML (во временный файл)
-    with NamedTemporaryFile(suffix=".pdf") as tmp:
-        tmp.write(content)
-        tmp.flush()
-        html = pdf_to_html(Path(tmp.name), scale=96/72, image_mode="auto", clip_oversample=2.0, debug=False)
+    # --- КОНВЕРТАЦИЯ ИЗ БАЙТОВ ---
+    try:
+        html = pdf_to_html(content, scale=96/72, image_mode="auto", clip_oversample=2.0, debug=False)
+    except Exception as e:
+        # важна понятная ошибка — чтобы видеть в логах
+        raise HTTPException(status_code=500, detail=f"PDF->HTML failed: {e!r}")
+
+    # гарантия непустого результата
+    if not isinstance(html, str) or len(html) < 32:
+        # 32 — просто формальная отсечка «совсем пусто/сломалось»
+        raise HTTPException(status_code=500, detail="PDF->HTML produced empty output")
 
     # 2) Сохраняем HTML на диск
     htmls_dir = UPLOAD_DIR / "htmls"
@@ -57,15 +64,16 @@ async def upload_pdf_and_convert_to_html(
     fpath = htmls_dir / fname
     fpath.write_text(html, encoding="utf-8")
 
-    # 3) Формируем относительный и абсолютный URL
+    # 3) URL для выдачи (предполагается static-маршрут /files/htmls/*)
     rel_url = f"/files/htmls/{fname}"
     abs_html_url = abs_url(request, rel_url)
 
-    # 4) По желанию: оставляем копию в БД (как было)
+    # 4) Кладём в БД (и ссылку, и копию)
     l.html_content = html
+    if hasattr(l, "html_url"):
+        l.html_url = abs_html_url
     await session.commit()
 
-    # 5) Возвращаем и факт сохранения, и URL файла
     return {
         "status": "ok",
         "html_saved_to_db": True,
