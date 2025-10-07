@@ -124,9 +124,13 @@ class Lesson(Base):
     subject_id: Mapped[int] = mapped_column(FK_INT, ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(LessonStatusEnum, nullable=False, server_default=text("'draft'"))
-    publish_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=False))  # доступно с этой даты/времени
+    publish_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=False))
 
     pdf_url: Mapped[Optional[str]] = mapped_column(Text)
+    # ▼ ДОБАВИТЬ:
+    pdf_filename: Mapped[Optional[str]] = mapped_column(String(255))
+    html_content: Mapped[Optional[str]] = mapped_column(Text)
+    html_url: Mapped[Optional[str]] = mapped_column(Text)
 
     group_id: Mapped[Optional[int]] = mapped_column(FK_INT, ForeignKey("groups.id", ondelete="SET NULL"))
     group: Mapped[Optional["Group"]] = relationship("Group", back_populates="lessons")
@@ -146,6 +150,7 @@ class Lesson(Base):
         Index("idx_lessons_group", "group_id"),
         Index("idx_lessons_publish_at", "publish_at"),
     )
+
 
 class LessonBlock(TimestampMixin, Base):
     __tablename__ = "lesson_blocks"

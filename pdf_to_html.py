@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-PDF -> HTML (текст сверху, картинки после текста и на местах)
-- Текст: абсолютно позиционированные спаны (PyMuPDF dict).
-- Картинки: два способа
-    1) extract  — вырезаем байты изображения (учитывая SMask/Mask), приводим к RGB и "сплющиваем" альфу на белый.
-    2) clip     — рендерим нужный участок страницы (page.get_pixmap(clip=...)) на белом фоне.
-- Режим изображений: --image-mode auto|extract|clip (по умолчанию auto: пытаемся extract, а для CMYK/ICC/SMask/Mask → clip).
-- Все PNG инлайн как data:URL. Текст остаётся поверх (z-index).
-
-Зависимости:
-    pip install pymupdf
-"""
 
 from __future__ import annotations
 import argparse
