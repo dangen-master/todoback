@@ -1,10 +1,14 @@
 # pdf_to_html.py
 from __future__ import annotations
+
+import base64
+import html as html_lib
+import os
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Union
-import base64, html as html_lib
+from typing import Dict, List, Optional, Tuple
+
 import fitz  # PyMuPDF
-from dataclasses import dataclass
+
 
 HTML_SHELL = """<!doctype html>
 <html lang="ru">
@@ -33,78 +37,105 @@ HTML_SHELL = """<!doctype html>
 </html>
 """
 
-# ========= helpers (как у тебя было) =========
+
+# --------------------------- small utils ---------------------------
+
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".part")
+    tmp.write_text(text, encoding=encoding)
+    os.replace(tmp, path)  # атомарная замена
+
 def _int_rgb_to_css(c: int) -> str:
-    r = (c >> 16) & 255; g = (c >> 8) & 255; b = c & 255
+    r = (c >> 16) & 255
+    g = (c >> 8) & 255
+    b = c & 255
     return f"rgb({r},{g},{b})"
 
 def _detect_bold_italic(font_name: str) -> tuple[bool, bool]:
-    name = font_name.lower()
+    name = (font_name or "").lower()
     bold = any(k in name for k in ("bold", "semibold", "demi", "black", "heavy"))
     italic = any(k in name for k in ("italic", "oblique", "ital"))
     return bold, italic
 
 def _sanitize_text(t: str) -> str:
-    t = t.replace("\r", "")
+    t = (t or "").replace("\r", "")
     return html_lib.escape(t, quote=False)
 
 def _png_dataurl_from_pixmap(pix: fitz.Pixmap) -> str:
-    png = pix.tobytes("png")
-    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+    return "data:image/png;base64," + base64.b64encode(pix.tobytes("png")).decode("ascii")
 
-def _pixmap_from_xref_safely(doc: fitz.Document, xref: int, smask_xref: Optional[int], mask_xref: Optional[int]) -> Optional[fitz.Pixmap]:
+
+# --------------------------- image helpers ---------------------------
+
+def _pixmap_from_xref_safely(
+    doc: fitz.Document, xref: int,
+    smask_xref: Optional[int], mask_xref: Optional[int]
+) -> Optional[fitz.Pixmap]:
+    """
+    Создаём Pixmap из xref, учитывая SMask/Mask, приводим к RGB и сплющиваем альфу на белый.
+    Возвращаем RGB без альфы.
+    """
     try:
         base = fitz.Pixmap(doc, xref)
+
         if smask_xref and not base.alpha:
             try:
                 sm = fitz.Pixmap(doc, smask_xref)
                 if sm.n != 1:
                     sm = fitz.Pixmap(fitz.csGRAY, sm)
-                base = fitz.Pixmap(base, sm)  # добавит альфу
+                base = fitz.Pixmap(base, sm)
             except Exception:
                 pass
+
         if not (base.colorspace and base.colorspace.n == 3):
             base = fitz.Pixmap(fitz.csRGB, base)
+
         if base.alpha:
             base = fitz.Pixmap(fitz.csRGB, base)
+
         return base
     except Exception:
         return None
 
 def _xref_meta_list(page: fitz.Page) -> List[Dict]:
+    """
+    Собираем изображения с bbox: комбинируем get_images/full, get_image_info и rawdict.
+    """
     meta: Dict[int, Dict] = {}
+
     for img in page.get_images(full=True):
         xref = img[0]
         smask = img[1] if len(img) > 1 else 0
         cs = img[5] if len(img) > 5 else None
         meta[xref] = {"xref": xref, "smask": smask or None, "mask": None, "cs": cs, "bbox": None}
+
     try:
         for rec in page.get_image_info(xrefs=True):
             xref = rec.get("xref")
-            if isinstance(xref, int):
-                meta.setdefault(xref, {"xref": xref, "smask": None, "mask": None, "cs": None, "bbox": None})
-                if rec.get("bbox"):
-                    meta[xref]["bbox"] = tuple(rec["bbox"])
-                if rec.get("smask"):
-                    meta[xref]["smask"] = rec.get("smask")
-                if rec.get("mask"):
-                    meta[xref]["mask"] = rec.get("mask")
+            if not isinstance(xref, int):
+                continue
+            m = meta.setdefault(xref, {"xref": xref, "smask": None, "mask": None, "cs": None, "bbox": None})
+            if rec.get("bbox"):
+                m["bbox"] = tuple(rec["bbox"])
+            if rec.get("smask"):
+                m["smask"] = rec.get("smask")
+            if rec.get("mask"):
+                m["mask"] = rec.get("mask")
     except Exception:
         pass
+
     raw = page.get_text("rawdict")
     for block in raw.get("blocks", []):
         if block.get("type") != 1:
             continue
         xref = block.get("image") if isinstance(block.get("image"), int) else block.get("number")
         if isinstance(xref, int):
-            meta.setdefault(xref, {"xref": xref, "smask": None, "mask": None, "cs": None, "bbox": None})
-            if not meta[xref]["bbox"] and block.get("bbox"):
-                meta[xref]["bbox"] = tuple(block["bbox"])
-    out: List[Dict] = []
-    for x in meta.values():
-        if x.get("bbox"):
-            out.append(x)
-    return out
+            m = meta.setdefault(xref, {"xref": xref, "smask": None, "mask": None, "cs": None, "bbox": None})
+            if not m["bbox"] and block.get("bbox"):
+                m["bbox"] = tuple(block["bbox"])
+
+    return [x for x in meta.values() if x.get("bbox")]
 
 def _should_clip(meta: Dict, image_mode: str) -> bool:
     if image_mode == "clip":
@@ -118,7 +149,7 @@ def _should_clip(meta: Dict, image_mode: str) -> bool:
         return True
     return False
 
-def _render_clip(page: fitz.Page, bbox_pt: Tuple[float,float,float,float], oversample: float = 2.0) -> fitz.Pixmap:
+def _render_clip(page: fitz.Page, bbox_pt: Tuple[float, float, float, float], oversample: float = 2.0) -> fitz.Pixmap:
     rect = fitz.Rect(*bbox_pt)
     mat = fitz.Matrix(oversample, oversample)
     pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
@@ -126,12 +157,23 @@ def _render_clip(page: fitz.Page, bbox_pt: Tuple[float,float,float,float], overs
         pix = fitz.Pixmap(fitz.csRGB, pix)
     return pix
 
-def _render_page_html(doc: fitz.Document, page_index: int, scale: float, image_mode: str, clip_oversample: float, debug: bool) -> str:
+
+# --------------------------- page render ---------------------------
+
+def _render_page_html(
+    doc: fitz.Document,
+    page_index: int,
+    scale: float,
+    image_mode: str,
+    clip_oversample: float,
+    debug: bool
+) -> str:
     page = doc[page_index]
     pw_pt, ph_pt = page.rect.width, page.rect.height
     pw_css = pw_pt * scale
     ph_css = ph_pt * scale
 
+    # текст
     tdict = page.get_text("dict")
     spans_html: List[str] = []
     for block in tdict.get("blocks", []):
@@ -155,15 +197,19 @@ def _render_page_html(doc: fitz.Document, page_index: int, scale: float, image_m
                     f"color:{color}",
                     f"font-family:{html_lib.escape(font)}",
                 ]
-                if bold: styles.append("font-weight:700")
-                if italic: styles.append("font-style:italic")
+                if bold:
+                    styles.append("font-weight:700")
+                if italic:
+                    styles.append("font-style:italic")
 
-                spans_html.append(f'<div class="t" style="{";".join(styles)}">{_sanitize_text(text)}</div>')
+                spans_html.append(
+                    f'<div class="t" style="{";".join(styles)}">{_sanitize_text(text)}</div>'
+                )
 
+    # изображения
     images_html: List[str] = []
     for meta in _xref_meta_list(page):
-        bbox = meta["bbox"]
-        x0, y0, x1, y1 = bbox
+        x0, y0, x1, y1 = meta["bbox"]
         width = (x1 - x0) * scale
         height = (y1 - y0) * scale
         if width <= 0 or height <= 0:
@@ -180,11 +226,12 @@ def _render_page_html(doc: fitz.Document, page_index: int, scale: float, image_m
                 use_clip = True
 
         if use_clip:
-            pix = _render_clip(page, bbox, oversample=clip_oversample)
+            pix = _render_clip(page, meta["bbox"], oversample=clip_oversample)
             dataurl = _png_dataurl_from_pixmap(pix)
 
         if debug:
-            print(f"[img] p{page_index+1} xref={meta.get('xref')} mode={'clip' if use_clip else 'extract'} cs={meta.get('cs')} bbox={bbox} ok={dataurl is not None}")
+            print(f"[img] p{page_index+1} xref={meta.get('xref')} mode={'clip' if use_clip else 'extract'} "
+                  f"cs={meta.get('cs')} bbox={meta['bbox']} ok={bool(dataurl)}")
 
         if not dataurl:
             continue
@@ -199,37 +246,45 @@ def _render_page_html(doc: fitz.Document, page_index: int, scale: float, image_m
         ]
         images_html.append(f'<img class="img" src="{dataurl}" alt="" style="{";".join(styles)}" />')
 
-    return f"""
-    <section class="page" style="width:{pw_css:.2f}px;height:{ph_css:.2f}px">
-      <div class="text-layer">{''.join(spans_html)}</div>
-      <div class="image-layer">{''.join(images_html)}</div>
-    </section>
-    """
+    return (
+        f'<section class="page" style="width:{pw_css:.2f}px;height:{ph_css:.2f}px">'
+        f'<div class="text-layer">{"".join(spans_html)}</div>'
+        f'<div class="image-layer">{"".join(images_html)}</div>'
+        f'</section>'
+    )
 
-def _doc_to_html(doc: fitz.Document, title: str, scale: float, image_mode: str, clip_oversample: float, debug: bool) -> str:
-    # если документ зашифрован — не сможем читать без пароля
-    if getattr(doc, "is_encrypted", False) and not doc.authenticate(""):
-        return HTML_SHELL.format(title=html_lib.escape(title), body="<p>Документ зашифрован и не может быть прочитан без пароля.</p>")
 
-    pages_html: List[str] = []
-    for i in range(len(doc)):
-        pages_html.append(_render_page_html(doc, i, scale, image_mode, clip_oversample, debug))
-    body = "\n".join(pages_html) if pages_html else "<p>В документе нет страниц.</p>"
-    return HTML_SHELL.format(title=html_lib.escape(title), body=body)
+# --------------------------- PUBLIC API ---------------------------
 
-# === ПУБЛИЧНАЯ ФУНКЦИЯ ===
-def pdf_to_html(input_pdf: Union[Path, bytes], *, scale: float = 96/72, image_mode: str = "auto", clip_oversample: float = 2.0, debug: bool = False) -> str:
+def pdf_to_html(
+    input_pdf: Path | str,
+    output_html: Path | str,
+    *,
+    scale: float = 96 / 72,
+    image_mode: str = "auto",      # "auto" | "extract" | "clip"
+    clip_oversample: float = 2.0,
+    debug: bool = False,
+) -> None:
     """
-    Конвертирует PDF в HTML.
-    input_pdf — Path к файлу ИЛИ bytes содержимое PDF.
+    Конвертирует PDF → HTML и СРАЗУ записывает в output_html (атомарно).
+    Никаких CLI-вызовов, только прямая функция.
     """
+    pdf_path = Path(input_pdf)
+    html_path = Path(output_html)
+
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
     assert image_mode in ("auto", "extract", "clip")
 
-    if isinstance(input_pdf, (bytes, bytearray, memoryview)):
-        data = bytes(input_pdf)
-        with fitz.open(stream=data, filetype="pdf") as doc:
-            return _doc_to_html(doc, "document", scale, image_mode, clip_oversample, debug)
-    else:
-        p = Path(input_pdf)
-        with fitz.open(p) as doc:
-            return _doc_to_html(doc, p.stem, scale, image_mode, clip_oversample, debug)
+    with fitz.open(pdf_path) as doc:
+        pages_html = [
+            _render_page_html(doc, i, scale, image_mode, clip_oversample, debug)
+            for i in range(len(doc))
+        ]
+    html_text = HTML_SHELL.format(
+        title=html_lib.escape(pdf_path.stem),
+        body="\n".join(pages_html),
+    )
+
+    _atomic_write_text(html_path, html_text, encoding="utf-8")
