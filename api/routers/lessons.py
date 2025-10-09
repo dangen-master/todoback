@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import datetime
+import os
 import re
 import asyncio
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,22 +24,33 @@ from repositories import lessons as lessons_repo
 router = APIRouter(tags=["lessons"])
 
 # =========================================================
-# logging (отдельная папка uploads/logs)
+# ПРОСТОЕ ЛОГИРОВАНИЕ (uploads/logs/log.txt)
 # =========================================================
 
-LOG_DIR = UPLOAD_DIR / "logs"
-LOG_FILE = LOG_DIR / "pdf_html.log"
+LOG_DIR = (UPLOAD_DIR / "logs")
+LOG_FILE = LOG_DIR / "log.txt"
 
-def _write_log(line: str) -> None:
-    """Пишем строку в uploads/logs/pdf_html.log (UTF-8, с таймстампом). Никогда не падаем из-за логгера."""
+def _now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+def _ensure_dirs() -> None:
+    # гарантируем нужные папки (на всякий случай, независимо от main.py)
+    (UPLOAD_DIR / "pdfs").mkdir(parents=True, exist_ok=True)
+    (UPLOAD_DIR / "htmls").mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+def _log(line: str) -> None:
     try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        _ensure_dirs()
         with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{ts} {line}\n")
+            f.write(f"{_now()} {line}\n")
     except Exception:
-        # не мешаем основному потоку работы
+        # лог вспомогательный — не ломаем основной поток
         pass
+
+# отметка при загрузке модуля
+_ensure_dirs()
+_log(f"MODULE_LOADED pid={os.getpid()} cwd={Path.cwd()} LOG_FILE={LOG_FILE.resolve()}")
 
 # =========================================================
 # helpers
@@ -49,15 +62,10 @@ async def _blocks_out(l: Lesson) -> list[LessonBlockOut]:
         for b in (l.blocks or [])
     ]
 
-# ——— Санитайзеры имён с сохранением Unicode/кириллицы ———
 _WIN_FORBIDDEN = r'\\/:*?"<>|'
 _CTRL_CHARS = r"[\u0000-\u001F\u007F]"
 
-def sanitize_filename(name: str | None, *, fallback: str = "document.pdf") -> str:
-    """
-    Для PDF: сохраняем Unicode/кириллицу, убираем только опасные символы путей, схлопываем пробелы.
-    Гарантируем расширение .pdf. Длина — до ~180 символов.
-    """
+def sanitize_filename(name: Optional[str], *, fallback: str = "document.pdf") -> str:
     base = (name or fallback).strip()
     base = re.sub(_CTRL_CHARS, "", base)
     base = re.sub(f"[{re.escape(_WIN_FORBIDDEN)}]+", "", base)
@@ -68,19 +76,14 @@ def sanitize_filename(name: str | None, *, fallback: str = "document.pdf") -> st
         base += ".pdf"
     return base[:180]
 
-def sanitize_html_name(name: str | None, *, fallback: str = "document.html") -> str:
-    """Для HTML: те же правила, расширение .html."""
+def sanitize_html_name(name: Optional[str], *, fallback: str = "document.html") -> str:
     pdf_like = sanitize_filename(name or "document.pdf")
     html_name = Path(pdf_like).with_suffix(".html").name
     return html_name[:180]
 
 def unique_named_path(folder: Path, filename: str) -> Path:
-    """
-    Возвращает уникальный путь для имени/расширения:
-      name.ext, name-1.ext, name-2.ext, ...
-    """
     folder.mkdir(parents=True, exist_ok=True)
-    p = folder / filename
+    p = (folder / filename)
     if not p.exists():
         return p
     stem = Path(filename).stem
@@ -93,89 +96,94 @@ def unique_named_path(folder: Path, filename: str) -> Path:
         i += 1
 
 # =========================================================
+# ЛОГИРУЮЩАЯ ЗАВИСИМОСТЬ (срабатывает до require_roles)
+# =========================================================
+
+async def log_request_dep(request: Request):
+    # Логируем каждый вход на /api/lessons... до авторизационных зависимостей
+    _log(f"REQ {request.method} {request.url.path} ct={request.headers.get('content-type')!r}")
+
+# =========================================================
 # routes
 # =========================================================
 
 @router.post(
-    "/lessons/{lesson_id}/pdf-html",
-    status_code=200,
-    dependencies=[Depends(require_roles("admin", "teacher"))],
+    "/lessons/{lesson_id}/pdf",
+    status_code=201,
+    dependencies=[Depends(log_request_dep), Depends(require_roles("admin", "teacher"))],
 )
-async def upload_pdf_and_convert_to_html(
+async def upload_lesson_pdf(
     lesson_id: int,
     request: Request,
     file: UploadFile = File(...),
     session: AsyncSession = Depends(get_session),
 ):
     """
-    Загружаем PDF с «родным» именем (Unicode ок), конвертируем его в HTML.
-    HTML получает такое же «родное» имя, но с .html.
-    Конвертер вызывается строго как pdf_to_html(pdf_path, html_path).
-    Перед вызовом и при ошибках пишем информацию в uploads/logs/pdf_html.log.
+    Загружаем PDF, сохраняем под человекочитаемым именем (Unicode ок),
+    конвертируем в HTML строго вызовом pdf_to_html(pdf_path, html_path),
+    логируем шаги и абсолютные пути (pdf_path, html_path) в uploads/logs/log.txt.
     """
     l = await session.get(Lesson, lesson_id)
     if not l:
+        _log(f"ERROR not_found lesson_id={lesson_id}")
         raise HTTPException(status_code=404, detail="Lesson not found")
 
     if file.content_type not in ("application/pdf",):
+        _log(f"ERROR bad_content_type ct={file.content_type!r}")
         raise HTTPException(status_code=415, detail="Only PDF is allowed")
 
     content = await file.read()
     if not content.startswith(b"%PDF-"):
-        raise HTTPException(status_code=415, detail="Not a valid PDF")
+        _log("ERROR bad_magic not_pdf")
+        raise HTTPException(status_code=415, detail="Not a valid PDF file")
 
-    pdfs_dir = UPLOAD_DIR / "pdfs"
-    htmls_dir = UPLOAD_DIR / "htmls"
+    pdfs_dir = (UPLOAD_DIR / "pdfs")
+    htmls_dir = (UPLOAD_DIR / "htmls")
     pdfs_dir.mkdir(parents=True, exist_ok=True)
     htmls_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Сохраняем PDF на диск с нормальным именем (с кириллицей)
-    original_pdf_name = sanitize_filename(file.filename or getattr(l, "pdf_filename", None) or "document.pdf")
-    pdf_path = unique_named_path(pdfs_dir, original_pdf_name)
+    # 1) сохраняем PDF
+    original_name = sanitize_filename(file.filename or getattr(l, "pdf_filename", None) or "document.pdf")
+    pdf_path = unique_named_path(pdfs_dir, original_name)
     pdf_path.write_bytes(content)
+    _log(f"PDF_SAVED path={pdf_path.resolve()} size={len(content)}")
 
-    # Проставляем ссылку и «родное» имя в БД
+    # 2) ссылка и «родное имя» в БД
     rel_pdf = f"/files/pdfs/{pdf_path.name}"
     l.pdf_url = abs_url(request, rel_pdf)
     if hasattr(l, "pdf_filename"):
-        l.pdf_filename = original_pdf_name
+        l.pdf_filename = original_name
     await session.commit()
+    _log(f"DB_PDF url={l.pdf_url} filename={getattr(l, 'pdf_filename', None)}")
 
-    # Небольшая пауза для файловой системы (редко, но помогает)
-    await asyncio.sleep(0.05)
-
-    # 2) Конвертация PDF -> HTML (строго pdf_to_html(pdf_path, html_path))
+    # 3) конвертируем в HTML (имя берём из «родного» имени пользователя)
     preferred_name = getattr(l, "pdf_filename", None) or (file.filename or pdf_path.name)
     html_filename = sanitize_html_name(preferred_name, fallback="document.html")
     html_path = unique_named_path(htmls_dir, html_filename)
 
-    # ЛОГ: записываем пути, вместо print
-    _write_log(f"pdf_to_html call: pdf_path={pdf_path} html_path={html_path}")
-
+    _log(f"CALL pdf_to_html pdf_path={pdf_path.resolve()} html_path={html_path.resolve()}")
     try:
-        from pdf_to_html import pdf_to_html  # функция должна записать HTML в html_path
+        from pdf_to_html import pdf_to_html
+        # строго: (pdf_path, html_path), функция ДОЛЖНА СОЗДАТЬ ФАЙЛ html_path
+        pdf_to_html(pdf_path, html_path)
     except Exception as e:
-        _write_log(f"[import_error] pdf_to_html import failed: {e!r} (pdf={pdf_path}, html={html_path})")
-        raise HTTPException(status_code=500, detail=f"pdf_to_html import failed: {e!r}")
-
-    try:
-        pdf_to_html(pdf_path, html_path)  # ← строго так, без CLI и доп. аргументов
-    except Exception as e:
-        _write_log(f"[convert_error] PDF->HTML failed: {e!r} (pdf={pdf_path}, html={html_path})")
+        _log(f"ERROR convert pdf_to_html {e!r} pdf_path={pdf_path.resolve()} html_path={html_path.resolve()}")
         raise HTTPException(status_code=500, detail=f"PDF->HTML failed: {e!r}")
 
     if not html_path.exists() or html_path.stat().st_size < 32:
-        _write_log(f"[convert_error] HTML empty or missing (pdf={pdf_path}, html={html_path})")
+        _log(f"ERROR html_empty path={html_path.resolve()} exists={html_path.exists()} "
+             f"size={(html_path.stat().st_size if html_path.exists() else 0)}")
         raise HTTPException(status_code=500, detail="PDF->HTML produced empty output")
 
-    # читаем HTML, кладём в БД и формируем URL
     html_text = html_path.read_text(encoding="utf-8")
-    rel_html = f"/files/htmls/{html_path.name}"
+    _log(f"HTML_SAVED path={html_path.resolve()} bytes={len(html_text.encode('utf-8'))}")
 
+    rel_html = f"/files/htmls/{html_path.name}"
     l.html_content = html_text
     if hasattr(l, "html_url"):
         l.html_url = abs_url(request, rel_html)
     await session.commit()
+    _log(f"DB_HTML url={getattr(l, 'html_url', None)}")
 
     return {
         "status": "ok",
@@ -191,7 +199,7 @@ async def upload_pdf_and_convert_to_html(
     "/lessons",
     response_model=LessonOut,
     status_code=201,
-    dependencies=[Depends(require_roles("admin", "teacher"))],
+    dependencies=[Depends(log_request_dep), Depends(require_roles("admin", "teacher"))],
 )
 async def create_lesson(
     request: Request,
@@ -254,11 +262,10 @@ async def create_lesson(
         html_url=getattr(lesson, "html_url", None),
     )
 
-
 @router.patch(
     "/lessons/{lesson_id}",
     response_model=LessonDetailOut,
-    dependencies=[Depends(require_roles("admin", "teacher"))],
+    dependencies=[Depends(log_request_dep), Depends(require_roles("admin", "teacher"))],
 )
 async def patch_lesson(
     lesson_id: int,
@@ -318,47 +325,7 @@ async def patch_lesson(
         html_url=getattr(l, "html_url", None),
     )
 
-
-@router.post(
-    "/lessons/{lesson_id}/pdf",
-    status_code=201,
-    dependencies=[Depends(require_roles("admin", "teacher"))],
-)
-async def upload_lesson_pdf(
-    lesson_id: int,
-    request: Request,
-    file: UploadFile = File(...),
-    session: AsyncSession = Depends(get_session),
-):
-    """
-    Простая загрузка PDF (без конвертации). Имя берётся «как есть» (после мягкого sanitize),
-    сохраняется человекочитаемым, с Unicode/кириллицей, с уникализацией -1, -2, ...
-    """
-    l = await session.get(Lesson, lesson_id)
-    if not l:
-        raise HTTPException(status_code=404, detail="Lesson not found")
-    if file.content_type not in ("application/pdf",):
-        raise HTTPException(status_code=415, detail="Only PDF is allowed")
-
-    content = await file.read()
-    if not content.startswith(b"%PDF-"):
-        raise HTTPException(status_code=415, detail="Not a valid PDF file")
-
-    folder = UPLOAD_DIR / "pdfs"
-    original_name = sanitize_filename(file.filename or getattr(l, "pdf_filename", None) or "document.pdf")
-    fpath = unique_named_path(folder, original_name)
-    fpath.write_bytes(content)
-
-    rel_path = f"/files/pdfs/{fpath.name}"
-    l.pdf_url = abs_url(request, rel_path)
-    if hasattr(l, "pdf_filename"):
-        l.pdf_filename = original_name
-
-    await session.commit()
-    return {"status": "ok", "pdf_url": l.pdf_url, "pdf_filename": original_name}
-
-
-@router.get("/lessons/accessible/{tg_id}", response_model=list[LessonOut])
+@router.get("/lessons/accessible/{tg_id}", response_model=list[LessonOut], dependencies=[Depends(log_request_dep)])
 async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_session)):
     user = await users_repo.get_user_by_tg(session, tg_id)
     if not user:
@@ -376,8 +343,7 @@ async def accessible_lessons(tg_id: int, session: AsyncSession = Depends(get_ses
         for l in lessons
     ]
 
-
-@router.get("/lessons/{lesson_id}", response_model=LessonDetailOut)
+@router.get("/lessons/{lesson_id}", response_model=LessonDetailOut, dependencies=[Depends(log_request_dep)])
 async def get_lesson_by_id(
     lesson_id: int,
     session: AsyncSession = Depends(get_session),
@@ -401,8 +367,7 @@ async def get_lesson_by_id(
         html_content=getattr(l, "html_content", None),
     )
 
-
-@router.delete("/lessons/{lesson_id}", status_code=204, dependencies=[Depends(require_roles("admin", "teacher"))])
+@router.delete("/lessons/{lesson_id}", status_code=204, dependencies=[Depends(log_request_dep), Depends(require_roles("admin", "teacher"))])
 async def delete_lesson_api(lesson_id: int, session: AsyncSession = Depends(get_session)):
     ok = await lessons_repo.delete_lesson(session, lesson_id)
     if not ok:

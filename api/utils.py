@@ -15,7 +15,7 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 # Публичный базовый URL сервера (для формирования абсолютных ссылок)
 PUBLIC_BACKEND_URL = os.getenv(
     "PUBLIC_BACKEND_URL",
-    "https://cautious-space-carnival-9g9996wrj7p2p7q6-8000.app.github.dev",
+    "https://zany-space-memory-57qqqv5jg742v4x-8000.app.github.dev",
 )
 
 
